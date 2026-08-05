@@ -10,6 +10,10 @@ import shutil
 import subprocess
 import sys
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENTRY = os.path.join(HERE, "main.py")
 DIST = os.path.join(HERE, "dist")
@@ -41,6 +45,7 @@ def build_pyinstaller():
         "--name", name,
         "--hidden-import=psutil",
         "--collect-all", "PySide6",
+        "--icon", os.path.join(HERE, "icon.ico"),
         "--add-data", f"{os.path.join(HERE, 'icon.ico')};.",
         "--add-binary", f"{os.path.join(HERE, 'uiaccess.dll')};.",
         "--distpath", os.path.join(HERE, "dist"),
@@ -62,6 +67,7 @@ def build_nuitka():
         "--windows-disable-console",
         "--windows-uac-admin",
         "--enable-plugin=pyside6",
+        f"--windows-icon-from-ico={os.path.join(HERE, 'icon.ico')}",
         "--include-package=psutil",
         f"--include-data-file={os.path.join(HERE, 'icon.ico')}=icon.ico",
         f"--include-data-file={os.path.join(HERE, 'uiaccess.dll')}=uiaccess.dll",

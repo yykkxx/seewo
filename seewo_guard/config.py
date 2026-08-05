@@ -70,6 +70,8 @@ def resource_path(name):
     cands.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), name))
     cands.append(os.path.join(BASE_DIR, name))
     cands.append(os.path.join(os.path.dirname(sys.argv[0]), name))
+    # Nuitka onefile: 资源解压在 sys.executable 所在的临时目录
+    cands.append(os.path.join(os.path.dirname(sys.executable), name))
     for p in cands:
         if os.path.exists(p):
             return p

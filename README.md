@@ -40,7 +40,13 @@ codex/
     ├── ipc.py                 # 本地回环 TCP IPC (服务端/客户端)
     ├── daemon.py              # 守护进程 (关机监听/GUI看护)
     ├── gui_app.py             # GUI 进程 (托盘/热键/功能)
+    ├── keyboard.py            # 全局键盘监听 (WH_KEYBOARD_LL 钩子)
     └── window_ops.py          # 窗口/杀进程/防录屏/禁网/虚拟桌面
+
+cpp/
+├── main.cpp                  # C++ 版 (托盘/钩子/杀进程/COM虚拟桌面/守护)
+├── icon.rc / app.manifest    # 图标与管理员清单
+└── build_cpp.ps1             # C++ 打包脚本 (cl.exe, /MT 静态单文件)
 ```
 
 ## 运行
@@ -80,14 +86,19 @@ python build.py nuitka        # -> dist\SeewoGuard_nuitka.exe
 # PyInstaller (需已安装: pip install pyinstaller)
 pyinstaller --noconfirm --onefile --noconsole --uac-admin --name SeewoGuard ^
   --hidden-import=psutil --collect-all PySide6 ^
+  --icon icon.ico ^
   --add-data "icon.ico;." --add-binary "uiaccess.dll;." main.py
 
 # Nuitka 4.x (需已安装: pip install nuitka; 带值选项须用 "=" 形式)
 python -m nuitka --onefile --windows-disable-console --windows-uac-admin ^
   --enable-plugin=pyside6 --include-package=psutil ^
+  --windows-icon-from-ico=icon.ico ^
   --include-data-file="icon.ico=icon.ico" --include-data-file="uiaccess.dll=uiaccess.dll" ^
   --output-dir=dist --output-filename=SeewoGuard.exe main.py
 ```
+
+> 图标: 两个打包器均通过 `--icon` / `--windows-icon-from-ico` 把 `icon.ico`
+> 嵌入 exe (资源图标, 非运行时替换)。
 
 打包产物同时包含 GUI 与守护进程, 通过 `--daemon` 参数切换。
 已实测两种打包器产物均可运行 (守护模式 IPC/退出 + GUI 自动退出均通过):
@@ -106,6 +117,7 @@ python -m nuitka --onefile --windows-disable-console --windows-uac-admin ^
 - 点击窗口 X / Alt+F4 / 任务栏关闭 = **收缩到托盘**, 程序继续守护。
 - 双击托盘图标 = 显示窗口。
 - 只有点击「完全退出」或托盘菜单「完全退出」才真正退出 (同时关闭守护进程)。
+- 完全退出**无确认弹窗**, 直接关闭 GUI 并通知守护进程一并退出。
 
 ## 虚拟桌面 (切换屏幕, 纯 COM)
 
@@ -121,10 +133,48 @@ python -m nuitka --onefile --windows-disable-console --windows-uac-admin ^
   匹配对应 vtable 布局 (参考 pyvda, 纯 ctypes 实现, 无第三方依赖)。
 - 提示: 目标窗口移动后可到新桌面找回; 托盘图标与守护进程不受影响。
 
+## 杀进程方式
+
+- Python 版统一使用 `os.kill(pid, signal.SIGTERM)` 后立即
+  `os.kill(pid, signal.SIGKILL)` (两个调用无间隔), 不再使用 psutil/taskkill。
+- C++ 版使用原生 `TerminateProcess` (等价于 SIGKILL)。
+- 按完整 exe 路径 (不区分大小写) 匹配进程, 不会误杀同名程序。
+
+## 键盘监听 (增强)
+
+- 使用 `WH_KEYBOARD_LL` 低级键盘钩子挂到系统钩子链末端, 可绕过普通软件的
+  应用层键盘钩子与键盘过滤器, 命中热键时直接吞掉按键 (其他软件收不到)。
+- 热键: `Ctrl+Alt+Y` 显示窗口 / `Ctrl+Alt+K` 杀进程 / `Ctrl+Alt+Q` 完全退出。
+- 钩子安装失败时自动回退 `RegisterHotKey`。
+- 驱动级键盘过滤驱动无法通过钩子绕过 (需内核驱动, 不在本版本范围)。
+
 ## 守护进程拉起速度
 
 - GUI 心跳丢失后守护进程**立即重启 GUI** (不再等待长宽限期)。
 - 守护进程启动后 6 秒内等待 GUI 注册, 未注册则主动拉起; 心跳超时阈值 4 秒。
+
+## C++ 版 (SeewoGuardCpp)
+
+纯 Win32/C++ 单文件实现, 功能与 Python 版对齐:
+
+- 双进程架构 (GUI + `--daemon` 守护), 命名管道 IPC + 心跳
+- 托盘图标 / X 收缩到托盘 / 只有「完全退出」才退出
+- `WH_KEYBOARD_LL` 键盘钩子 (Ctrl+Alt+Y/K/Q)
+- 杀进程 (`TerminateProcess`, 按完整路径匹配)
+- 虚拟桌面 (纯 COM, 与 Python 版相同的 vtable 布局探测, 兼容 Win10/Win11)
+- 守护进程监听关机 (WM_QUERYENDSESSION), GUI 被杀后自动重启 (最多 5 次)
+
+构建 (需 VS 2022 Build Tools, 含 C++ 工作负载):
+
+```powershell
+cd C:\yykkxx\code\seewo\codex\cpp
+powershell -ExecutionPolicy Bypass -File build_cpp.ps1
+# -> ..\dist\SeewoGuardCpp.exe  (~270 KB, /MT 静态, 单文件无依赖)
+```
+
+运行方式与 Python 版一致: 双击即 GUI 模式, `SeewoGuardCpp.exe --daemon` 守护模式;
+测试用 `SeewoGuardCpp.exe --test-auto-quit` (4 秒后自动完全退出)。
+日志: `dist\seewo_guard_cpp.log`。
 
 ## 测试模式 (开发用)
 

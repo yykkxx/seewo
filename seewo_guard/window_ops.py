@@ -7,6 +7,7 @@ window_ops.py - 窗口 / 进程 / 网络 / 虚拟桌面操作 (GUI 使用)
 """
 import ctypes
 import os
+import signal
 import time
 import logging
 import subprocess
@@ -138,15 +139,13 @@ def set_zbid_and_notopmost(exe_path):
 
 
 def force_kill_process(pid):
-    """强制终止指定 PID"""
+    """强制终止指定 PID (os.kill: SIGTERM 后直接 SIGKILL, 无间隔)"""
     try:
-        proc = psutil.Process(pid)
-        proc.terminate()
-        try:
-            proc.wait(timeout=0.3)
-        except psutil.TimeoutExpired:
-            proc.kill()
-    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        os.kill(pid, signal.SIGTERM)
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except (PermissionError, OSError):
         pass
     except Exception:
         pass

@@ -20,7 +20,7 @@ import logging
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QWidget, QPushButton, QVBoxLayout, QHBoxLayout,
-    QComboBox, QLabel, QMessageBox, QSystemTrayIcon, QMenu,
+    QComboBox, QLabel, QMessageBox, QStyle, QSystemTrayIcon, QMenu,
 )
 from PySide6.QtGui import QIcon, QAction, QTextCursor
 
@@ -75,6 +75,7 @@ class GuardWindow(QWidget):
         self._record_thread = None
         self._tray = None
         self._top_ticks = 0
+        self._unregister_hotkey = None
 
         self.setWindowTitle(APP_NAME)
         self.resize(460, 470)
@@ -196,6 +197,22 @@ class GuardWindow(QWidget):
     # 热键
     # ==========================================
     def _register_hotkeys(self):
+        self._kb_hook = None
+        self._WM_APP_HOTKEY = 0
+        # 优先 LL 键盘钩子 (绕过普通应用层钩子/键盘过滤器)
+        try:
+            from seewo_guard.keyboard import KeyboardHook, WM_APP_HOTKEY
+            hwnd = int(self.winId())
+            hook = KeyboardHook(hwnd)
+            if hook.start():
+                self._kb_hook = hook
+                self._WM_APP_HOTKEY = WM_APP_HOTKEY
+                logging.info("✓ 全局热键已注册 (LL钩子: Ctrl+Alt+Y/K/Q)")
+                return
+            logging.warning("LL 钩子未就绪, 回退 RegisterHotKey")
+        except Exception as e:
+            logging.error(f"LL 钩子注册异常: {e}, 回退 RegisterHotKey")
+        # 兜底: 传统 RegisterHotKey
         try:
             from seewo_guard.win_api import RegisterHotKey, UnregisterHotKey
             self._unregister_hotkey = UnregisterHotKey
@@ -204,14 +221,15 @@ class GuardWindow(QWidget):
                   RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_ALT, 0x4B) and
                   RegisterHotKey(hwnd, 3, MOD_CONTROL | MOD_ALT, 0x51))
             if ok:
-                logging.info("✓ 全局热键已注册 (Ctrl+Alt+Y/K/Q)")
+                logging.info("✓ 全局热键已注册 (RegisterHotKey: Ctrl+Alt+Y/K/Q)")
         except Exception as e:
             logging.error(f"热键注册异常: {e}")
 
     def nativeEvent(self, eventType, message):
         try:
             msg = _wintypes.MSG.from_address(int(message))
-            if msg.message == WM_HOTKEY:
+            if msg.message == WM_HOTKEY or (self._WM_APP_HOTKEY
+                                           and msg.message == self._WM_APP_HOTKEY):
                 hid = msg.wParam
                 if hid == 1:
                     self._show_window()
@@ -243,7 +261,7 @@ class GuardWindow(QWidget):
                 return
             icon_path = resource_path('icon.ico')
             icon = (QIcon(icon_path) if os.path.exists(icon_path)
-                    else self.style().standardIcon(self.style().SP_ComputerIcon))
+                    else self.style().standardIcon(QStyle.SP_ComputerIcon))
             self.setWindowIcon(icon)
 
             menu = QMenu(self)
@@ -270,6 +288,8 @@ class GuardWindow(QWidget):
     # 置顶 / 防录屏
     # ==========================================
     def keep_on_top(self):
+        if not self.isVisible():
+            return  # 窗口已收缩到托盘: 不再置顶/显示 (避免白屏残留)
         try:
             hwnd = int(self.winId())
             SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
@@ -513,15 +533,7 @@ class GuardWindow(QWidget):
     # 退出
     # ==========================================
     def on_full_quit(self):
-        reply = QMessageBox.question(
-            self, "确认完全退出",
-            "完全退出将同时关闭守护进程\n"
-            "(守护进程会一并安全退出)\n\n"
-            "确定要完全退出吗?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply != QMessageBox.Yes:
-            logging.info("已取消退出")
-            return
+        """完全退出 (不弹确认框, 直接安全退出)"""
         self._request_quit()
 
     def _request_quit(self):
@@ -543,10 +555,13 @@ class GuardWindow(QWidget):
         except Exception:
             pass
         try:
+            if self._kb_hook:
+                self._kb_hook.stop()
             hwnd = int(self.winId())
-            self._unregister_hotkey(hwnd, 1)
-            self._unregister_hotkey(hwnd, 2)
-            self._unregister_hotkey(hwnd, 3)
+            if self._unregister_hotkey:
+                self._unregister_hotkey(hwnd, 1)
+                self._unregister_hotkey(hwnd, 2)
+                self._unregister_hotkey(hwnd, 3)
         except Exception:
             pass
 
@@ -569,6 +584,7 @@ class GuardWindow(QWidget):
         logging.info("🚫 关闭请求已拦截, 收缩到托盘 (只有「完全退出」才退出)")
         event.ignore()
         self.hide()
+        self.top_timer.stop()  # 防止置顶定时器把窗口重新显示
         if self._tray:
             self._tray.showMessage("SeewoGuard", "程序仍在守护中, 双击托盘图标显示窗口",
                                    QSystemTrayIcon.Information, 2000)
@@ -579,6 +595,8 @@ class GuardWindow(QWidget):
         self.raise_()
         self.activateWindow()
         self.keep_on_top()
+        if not self.top_timer.isActive():
+            self.top_timer.start(1000)
 
 
 # ==========================================

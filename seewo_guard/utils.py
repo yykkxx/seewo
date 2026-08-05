@@ -4,6 +4,7 @@ utils.py - 通用工具
 包含: 会话ID / 控制台隐藏 / 提权 / 单实例锁 / 隐藏启动 / 窗口激活
 """
 import os
+import signal
 import sys
 import ctypes
 import logging
@@ -225,15 +226,13 @@ def pid_alive(pid):
 
 
 def kill_pid(pid):
-    """强制结束指定 PID"""
+    """强制结束指定 PID (os.kill: SIGTERM 后直接 SIGKILL, 无间隔)"""
     try:
-        proc = psutil.Process(pid)
-        proc.terminate()
-        try:
-            proc.wait(timeout=0.5)
-        except psutil.TimeoutExpired:
-            proc.kill()
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        os.kill(pid, signal.SIGTERM)
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except (PermissionError, OSError):
         pass
     except Exception:
         pass
