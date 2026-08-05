@@ -63,11 +63,15 @@ python main.py --gui
 ## 打包
 
 ```powershell
-# PyInstaller
+# PyInstaller -> dist\SeewoGuard.exe
 python build.py pyinstaller
 
-# Nuitka
+# Nuitka -> dist\SeewoGuard.exe
 python build.py nuitka
+
+# 指定产物名 (两个版本可并存, 如:)
+$env:SEEWO_OUTPUT = "SeewoGuard_nuitka"
+python build.py nuitka        # -> dist\SeewoGuard_nuitka.exe
 ```
 
 等价手工命令 (需在项目目录下执行):
@@ -78,14 +82,24 @@ pyinstaller --noconfirm --onefile --noconsole --uac-admin --name SeewoGuard ^
   --hidden-import=psutil --collect-all PySide6 ^
   --add-data "icon.ico;." --add-binary "uiaccess.dll;." main.py
 
-# Nuitka (需已安装: pip install nuitka)
+# Nuitka 4.x (需已安装: pip install nuitka; 带值选项须用 "=" 形式)
 python -m nuitka --onefile --windows-disable-console --windows-uac-admin ^
   --enable-plugin=pyside6 --include-package=psutil ^
   --include-data-file="icon.ico=icon.ico" --include-data-file="uiaccess.dll=uiaccess.dll" ^
   --output-dir=dist --output-filename=SeewoGuard.exe main.py
 ```
 
-打包产物: `dist\SeewoGuard.exe` (同时包含 GUI 与守护进程, 通过 `--daemon` 参数切换)。
+打包产物同时包含 GUI 与守护进程, 通过 `--daemon` 参数切换。
+已实测两种打包器产物均可运行 (守护模式 IPC/退出 + GUI 自动退出均通过):
+
+| 打包器 | 产物 | 体积 | 说明 |
+| --- | --- | --- | --- |
+| PyInstaller | `dist\SeewoGuard.exe` | ~240 MB | 启动稍慢 (onefile 解压) |
+| Nuitka | `dist\SeewoGuard_nuitka.exe` | ~70 MB | 启动快, 体积小 |
+
+> Nuitka 兼容说明: Nuitka 不设置 `sys.frozen`, 代码用 `__compiled__`
+> 识别编译产物; onefile 下 `sys.executable` 指向临时解压目录,
+> 程序真实路径取自 `sys.argv[0]` (日志/状态文件仍写在 exe 目录)。
 
 ## 托盘与退出规则
 

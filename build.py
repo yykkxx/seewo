@@ -28,12 +28,17 @@ def _ensure_assets():
             print(f"[提示] 未找到 {src}")
 
 
+def _output_name():
+    return os.environ.get("SEEWO_OUTPUT", "SeewoGuard")
+
+
 def build_pyinstaller():
     _ensure_assets()
+    name = _output_name()
     cmd = [
-        sys.executable, "-m", "pyinstaller",
+        sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--onefile", "--noconsole", "--uac-admin",
-        "--name", "SeewoGuard",
+        "--name", name,
         "--hidden-import=psutil",
         "--collect-all", "PySide6",
         "--add-data", f"{os.path.join(HERE, 'icon.ico')};.",
@@ -45,11 +50,12 @@ def build_pyinstaller():
     ]
     print(f"[PyInstaller] {' '.join(cmd)}")
     subprocess.run(cmd, check=True)
-    print("\n✅ 打包完成: dist\\SeewoGuard.exe")
+    print(f"\n✅ 打包完成: dist\\{name}.exe")
 
 
 def build_nuitka():
     _ensure_assets()
+    name = _output_name()
     cmd = [
         sys.executable, "-m", "nuitka",
         "--onefile",
@@ -57,15 +63,15 @@ def build_nuitka():
         "--windows-uac-admin",
         "--enable-plugin=pyside6",
         "--include-package=psutil",
-        "--include-data-file", f"{os.path.join(HERE, 'icon.ico')}=icon.ico",
-        "--include-data-file", f"{os.path.join(HERE, 'uiaccess.dll')}=uiaccess.dll",
-        "--output-dir", os.path.join(HERE, "dist"),
-        "--output-filename=SeewoGuard.exe",
+        f"--include-data-file={os.path.join(HERE, 'icon.ico')}=icon.ico",
+        f"--include-data-file={os.path.join(HERE, 'uiaccess.dll')}=uiaccess.dll",
+        f"--output-dir={os.path.join(HERE, 'dist')}",
+        f"--output-filename={name}.exe",
         ENTRY,
     ]
     print(f"[Nuitka] {' '.join(cmd)}")
     subprocess.run(cmd, check=True)
-    print("\n✅ 打包完成: dist\\SeewoGuard.exe")
+    print(f"\n✅ 打包完成: dist\\{name}.exe")
 
 
 if __name__ == "__main__":

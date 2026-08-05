@@ -5,13 +5,27 @@ config.py - 全局配置 (v4.0 双进程版)
 import os
 import sys
 
-IS_FROZEN = getattr(sys, 'frozen', False)
+IS_COMPILED = "__compiled__" in globals()          # Nuitka 编译产物
+IS_FROZEN = getattr(sys, 'frozen', False) or IS_COMPILED
+
+
+def self_exe():
+    """当前程序可执行文件: 打包后为真实 exe, 脚本模式为 python
+
+    Nuitka onefile 的 sys.executable 指向临时解压目录, 不可用;
+    sys.argv[0] 才是真实 exe 路径 (PyInstaller 两者一致)。
+    """
+    if IS_FROZEN:
+        if IS_COMPILED:
+            return os.path.abspath(sys.argv[0])
+        return sys.executable
+    return sys.executable
 
 
 def _base_dir():
     """程序根目录: 打包后为 exe 所在目录, 脚本模式为 codex/ 项目根"""
     if IS_FROZEN:
-        return os.path.dirname(sys.executable)
+        return os.path.dirname(self_exe())
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 

@@ -527,6 +527,7 @@ class GuardWindow(QWidget):
     def _request_quit(self):
         """安全退出: 通知守护进程关闭, 然后退出本进程"""
         logging.info("👋 请求完全退出...")
+        self._quitting = True  # 完全退出中: closeEvent 不再拦截
         self._stop.set()
         for t, name in [(self._kill_thread, "杀进程"), (self._record_thread, "防录屏")]:
             if t and t.is_alive():
@@ -561,7 +562,10 @@ class GuardWindow(QWidget):
         QApplication.instance().quit()
 
     def closeEvent(self, event):
-        """点击 X / Alt+F4 / 任务栏关闭 -> 一律收缩到托盘"""
+        """点击 X / Alt+F4 / 任务栏关闭 -> 收缩到托盘; 完全退出时放行"""
+        if getattr(self, "_quitting", False):
+            event.accept()
+            return
         logging.info("🚫 关闭请求已拦截, 收缩到托盘 (只有「完全退出」才退出)")
         event.ignore()
         self.hide()

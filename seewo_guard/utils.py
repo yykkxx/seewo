@@ -12,7 +12,7 @@ import threading
 
 import psutil
 
-from seewo_guard.config import IS_FROZEN
+from seewo_guard.config import IS_FROZEN, self_exe
 from seewo_guard.win_api import (
     kernel32, user32, GetConsoleWindow, ShowWindow, SW_HIDE, SW_RESTORE,
     ProcessIdToSessionId, CreateMutexW, ReleaseMutex, CloseHandle,
@@ -37,7 +37,7 @@ def get_session_id():
 def get_self_path():
     """当前脚本 / exe 的绝对路径"""
     if IS_FROZEN:
-        return sys.executable
+        return self_exe()
     return os.path.abspath(sys.argv[0])
 
 
@@ -86,7 +86,7 @@ def spawn_hidden(args):
 def daemon_cmd():
     """构造守护进程启动命令 (兼容打包/脚本)"""
     if IS_FROZEN:
-        return [sys.executable, "--daemon"]
+        return [self_exe(), "--daemon"]
     return [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                          '..', 'main.py'), "--daemon"]
 
@@ -94,7 +94,7 @@ def daemon_cmd():
 def gui_cmd():
     """构造 GUI 进程启动命令 (守护进程拉起 GUI 用)"""
     if IS_FROZEN:
-        return [sys.executable, "--gui"]
+        return [self_exe(), "--gui"]
     return [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                          '..', 'main.py'), "--gui"]
 
@@ -113,7 +113,10 @@ def request_elevation():
     """请求 UAC 提权并退出当前实例"""
     script = get_self_path()
     try:
-        ShellExecuteW(None, "runas", sys.executable, f'"{script}"', None, 1)
+        if IS_FROZEN:
+            ShellExecuteW(None, "runas", script, None, None, 1)
+        else:
+            ShellExecuteW(None, "runas", sys.executable, f'"{script}"', None, 1)
     except Exception as e:
         logging.error(f"提权失败: {e}")
     return
