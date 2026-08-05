@@ -93,12 +93,24 @@ python -m nuitka --onefile --windows-disable-console --windows-uac-admin ^
 - 双击托盘图标 = 显示窗口。
 - 只有点击「完全退出」或托盘菜单「完全退出」才真正退出 (同时关闭守护进程)。
 
-## 虚拟桌面 (切换屏幕)
+## 虚拟桌面 (切换屏幕, 纯 COM)
 
+- 全部操作走 Windows COM 接口, **不模拟按键** (不再有 Win+Ctrl+D 热键延迟):
+  - 新建/切换/删除桌面: `IVirtualDesktopManagerInternal`
+    (通过 `CLSID_ImmersiveShell -> IServiceProvider.QueryService` 获取)
+  - 移动窗口: `IApplicationViewCollection.GetViewForHwnd` + `MoveViewToDesktop`
+    (公开接口 `MoveWindowToDesktop` 常返回拒绝访问, 故不采用)
 - 「新建桌面并移动」: 创建新桌面, 把希沃目标程序的全部窗口移入新桌面,
   然后**主视角自动切回当前桌面** (目标窗口被藏到新桌面, 不影响当前操作)。
 - 「移动」: 把当前窗口移动到所选桌面, 并切换到该桌面视角。
+- 兼容 Win10 1809~22H2 与 Win11 (含 24H2): 启动时逐一探测内部接口 IID,
+  匹配对应 vtable 布局 (参考 pyvda, 纯 ctypes 实现, 无第三方依赖)。
 - 提示: 目标窗口移动后可到新桌面找回; 托盘图标与守护进程不受影响。
+
+## 守护进程拉起速度
+
+- GUI 心跳丢失后守护进程**立即重启 GUI** (不再等待长宽限期)。
+- 守护进程启动后 6 秒内等待 GUI 注册, 未注册则主动拉起; 心跳超时阈值 4 秒。
 
 ## 测试模式 (开发用)
 

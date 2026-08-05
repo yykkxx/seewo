@@ -39,8 +39,8 @@ TARGET_EXES = [
 
 # ---------- 守护参数 ----------
 MAX_GUI_RESTARTS = 5          # GUI 连续崩溃最大重启次数
-DAEMON_GUI_TIMEOUT = 6.0      # GUI 心跳超时阈值 (秒)
-DAEMON_START_GRACE = 15.0     # 守护进程启动宽限期 (秒), 避免误判
+DAEMON_GUI_TIMEOUT = 4.0      # GUI 心跳超时阈值 (秒)
+DAEMON_START_GRACE = 6.0      # 守护进程启动宽限期 (秒): 等待 GUI 注册
 GUI_HEARTBEAT = 2.0           # GUI 心跳间隔 (秒)
 DAEMON_TICK = 0.5             # 守护主循环间隔 (秒)
 

@@ -208,25 +208,31 @@ class DaemonApp:
         return False
 
     def _watchdog_tick(self):
-        """GUI 心跳检查: 超时则重启 GUI"""
+        """GUI 心跳检查: 心跳丢失立即重启 GUI (不等长宽限期)"""
         now = time.monotonic()
-        if not self._gui_pid:
-            return
-        # 启动宽限期: 守护刚启动时 GUI 可能尚未就绪
+        # 启动宽限期: 等待 GUI 首次注册 (GUI 就绪后 1-2 秒内会 hello)
         if now - self._start_time < DAEMON_START_GRACE:
             return
-        if now - self._last_hb <= DAEMON_GUI_TIMEOUT:
-            return
 
-        self._restart_count += 1
-        self._gui_pid = 0
+        if self._gui_pid:
+            if now - self._last_hb <= DAEMON_GUI_TIMEOUT:
+                return
+            # 心跳丢失 (GUI 被任务管理器结束等)
+            self._restart_count += 1
+            self._gui_pid = 0
+        else:
+            # 守护启动后从未收到 GUI 注册: 主动拉起一次
+            if self._expecting_pid and pid_alive(self._expecting_pid):
+                return  # 已拉起的 GUI 还在启动中
+            self._restart_count += 1
+
         if self._restart_count > MAX_GUI_RESTARTS:
             logging.critical(f"💀 GUI 连续异常 {MAX_GUI_RESTARTS} 次, "
                              "守护进程安全退出")
             self._stop.set()
             return
 
-        logging.warning(f"⚠️ GUI 心跳丢失 ({self._restart_count}/{MAX_GUI_RESTARTS}), "
+        logging.warning(f"⚠️ GUI 缺失 ({self._restart_count}/{MAX_GUI_RESTARTS}), "
                         "重新拉起 GUI...")
         proc = spawn_hidden(gui_cmd())
         if proc:
