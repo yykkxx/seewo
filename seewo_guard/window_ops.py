@@ -263,6 +263,14 @@ class VirtualDesktopManager:
             return 1
 
     def move_to_desktop(self, hwnd, idx):
+        """移动窗口到指定桌面并切换视角到该桌面"""
+        if not self._move_window_only(hwnd, idx):
+            return False
+        self._switch_desktop(idx)
+        return True
+
+    def _move_window_only(self, hwnd, idx):
+        """仅把窗口移动到指定桌面 (不切换视角)"""
         if not self._avail:
             return False
         try:
@@ -284,12 +292,9 @@ class VirtualDesktopManager:
             move_fn = ctypes.cast(vtable[5], ctypes.CFUNCTYPE(
                 HRESULT, c_void_p, _wintypes.HWND, c_void_p))
             hr = move_fn(ppv, hwnd, ctypes.byref(guid))
-            if hr == 0:
-                self._switch_desktop(idx)
-                return True
-            return False
+            return hr == 0
         except Exception as e:
-            logging.error(f"移动桌面失败: {e}")
+            logging.error(f"移动窗口到桌面失败: {e}")
             return False
 
     def _get_desktop_guid(self, idx):
@@ -318,11 +323,11 @@ class VirtualDesktopManager:
             return None
         return None
 
-    def _switch_desktop(self, idx):
+    def _switch_desktop(self, idx, from_idx=None):
         try:
             VK_LWIN, VK_CTRL = 0x5B, 0x11
             VK_LEFT, VK_RIGHT = 0x25, 0x27
-            cur = self._get_cur_desktop_idx()
+            cur = self._get_cur_desktop_idx() if from_idx is None else from_idx
             steps = idx - (cur or 0)
             if steps == 0:
                 return
@@ -355,9 +360,16 @@ class VirtualDesktopManager:
             pass
         return 0
 
-    def create_new_desktop_and_move(self, hwnd):
-        """Win+Ctrl+D 新建桌面并移动窗口"""
+    def create_new_desktop_and_move(self, hwnds):
+        """新建桌面并把窗口移动到新桌面, 主视角切回原桌面
+
+        返回 (新桌面索引, 成功移动的窗口数); 失败返回 (-1, 0)。
+        """
+        if isinstance(hwnds, (int, _wintypes.HWND)):
+            hwnds = [hwnds]
         try:
+            cur = self._get_cur_desktop_idx()
+            # Win+Ctrl+D 新建桌面 (创建后视角自动切到新桌面)
             VK_LWIN, VK_CTRL, VK_D = 0x5B, 0x11, 0x44
             user32.keybd_event(VK_LWIN, 0, 0, 0)
             user32.keybd_event(VK_CTRL, 0, 0, 0)
@@ -367,10 +379,18 @@ class VirtualDesktopManager:
             user32.keybd_event(VK_D, 0, 0x0002, 0)
             user32.keybd_event(VK_CTRL, 0, 0x0002, 0)
             user32.keybd_event(VK_LWIN, 0, 0x0002, 0)
-            time.sleep(0.5)
-            idx = self.get_desktop_count() - 1
-            if self.move_to_desktop(hwnd, idx):
-                return idx
+            time.sleep(0.6)  # 等待新桌面创建完成 (注册表刷新)
+            new_idx = self.get_desktop_count() - 1
+            moved = 0
+            for hwnd in hwnds:
+                if self._move_window_only(hwnd, new_idx):
+                    moved += 1
+            # 主视角切回原桌面
+            if new_idx != cur:
+                self._switch_desktop(cur, from_idx=new_idx)
+            logging.info(f"✅ 已新建桌面#{new_idx}, 移动 {moved}/{len(hwnds)} "
+                         f"个窗口, 视角已切回桌面#{cur}")
+            return new_idx, moved
         except Exception as e:
             logging.error(f"新建桌面失败: {e}")
-        return -1
+        return -1, 0

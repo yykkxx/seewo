@@ -490,11 +490,22 @@ class GuardWindow(QWidget):
             logging.error("❌ 移动失败")
 
     def on_new_desktop(self):
-        idx = self.vd.create_new_desktop_and_move(int(self.winId()))
+        """新建桌面, 把目标程序窗口移过去, 主视角切回当前桌面"""
+        hwnds = []
+        for exe in TARGET_EXES:
+            hwnds.extend(find_all_windows_by_path(exe))
+        if not hwnds:
+            QMessageBox.information(self, "提示", "未找到目标程序窗口, 无法移动")
+            return
+        idx, moved = self.vd.create_new_desktop_and_move(hwnds)
         if idx >= 0:
             self._refresh_desktops()
-            logging.info(f"✅ 已新建桌面并移动 (桌面 {idx})")
-            self.hide()
+            self.cmb_desk.setCurrentIndex(idx)
+            if self._tray:
+                self._tray.showMessage(
+                    APP_NAME, f"已把 {moved} 个窗口移入新桌面 {idx}, 主视角已切回",
+                    QSystemTrayIcon.Information, 2500)
+            logging.info(f"✅ 已新建桌面 {idx}, 移动 {moved} 个窗口, 主视角已切回")
         else:
             logging.error("❌ 新建桌面失败")
 
