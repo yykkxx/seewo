@@ -641,12 +641,16 @@ def gui_main():
             logging.info("🔐 通过 UIAccess 启动新实例...")
             try:
                 from seewo_guard.win_api import ProcessIdToSessionId, kernel32
+                from seewo_guard.utils import clean_env_context
                 sid = _wintypes.DWORD(0)
                 pid = _wintypes.DWORD(0)
                 kernel32.ProcessIdToSessionId(kernel32.GetCurrentProcessId(),
                                               ctypes.byref(sid))
-                success = StartUIAccessProcess(None, cmd, 0,
-                                               ctypes.byref(pid), sid.value)
+                # 该 DLL 内部启动进程会继承环境, 需临时清掉打包器变量,
+                # 否则新实例 bootloader 误判继承关系导致 Python 启动失败
+                with clean_env_context():
+                    success = StartUIAccessProcess(None, cmd, 0,
+                                                   ctypes.byref(pid), sid.value)
                 if success:
                     logging.info(f"✅ UIAccess 子进程已启动 PID={pid.value}")
                     shutdown_logging()

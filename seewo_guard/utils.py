@@ -68,11 +68,59 @@ def hidden_creationflags():
     return 0x08000000  # CREATE_NO_WINDOW
 
 
+# ==========================================
+# 打包器环境变量清理 (PyInstaller / Nuitka onefile)
+# ==========================================
+# 单文件打包后, 当前 Python 子进程会继承 bootloader 的内部环境变量
+# (_PYI_ARCHIVE_FILE / _PYI_PARENT_PROCESS_LEVEL / _PYI_APPLICATION_HOME_DIR,
+#  Nuitka onefile 为 NUITKA_* 系列)。
+# 若不清理, 由本程序拉起的 exe 会被 bootloader 误判为"同一进程树的子进程",
+# 从而跳过临时目录解压, 直接初始化 Python -> 必然失败
+# ("Failed to start embedded Python interpreter"), 并连带临时目录无法移除。
+_STRIP_ENV_PREFIXES = ("_PYI_", "NUITKA_")
+
+
+def _strip_packager_env(env):
+    for key in [k for k in env if k.startswith(_STRIP_ENV_PREFIXES)]:
+        del env[key]
+    return env
+
+
+def clean_child_env():
+    """返回传给子进程的环境副本: 移除打包器内部变量"""
+    return _strip_packager_env(os.environ.copy())
+
+
+class _CleanEnvContext:
+    """临时从当前进程环境移除打包器变量 (ShellExecuteW 等无法传 env 的场景)"""
+
+    def __enter__(self):
+        self._saved = {}
+        for key in [k for k in os.environ if k.startswith(_STRIP_ENV_PREFIXES)]:
+            self._saved[key] = os.environ.pop(key)
+        return self
+
+    def __exit__(self, *exc_info):
+        for key, value in self._saved.items():
+            os.environ[key] = value
+        return False
+
+
+def clean_env_context():
+    """上下文管理器: 临时清理当前进程的打包器环境变量, 退出时恢复"""
+    return _CleanEnvContext()
+
+
 def spawn_hidden(args):
-    """以隐藏方式启动子进程, 返回 Popen 或 None"""
+    """以隐藏方式启动子进程, 返回 Popen 或 None
+
+    必须传干净环境: 避免打包器内部变量 (_PYI_* / NUITKA_*) 被继承,
+    否则子进程 bootloader 会误判父子关系导致 Python 启动失败。
+    """
     try:
         return subprocess.Popen(
             args,
+            env=clean_child_env(),
             startupinfo=hidden_startupinfo(),
             creationflags=hidden_creationflags(),
             stdin=subprocess.DEVNULL,
@@ -114,10 +162,13 @@ def request_elevation():
     """请求 UAC 提权并退出当前实例"""
     script = get_self_path()
     try:
-        if IS_FROZEN:
-            ShellExecuteW(None, "runas", script, None, None, 1)
-        else:
-            ShellExecuteW(None, "runas", sys.executable, f'"{script}"', None, 1)
+        # ShellExecuteW 无法显式传 env, 临时清掉打包器变量再启动,
+        # 避免提权后的新 bootloader 误判继承关系
+        with clean_env_context():
+            if IS_FROZEN:
+                ShellExecuteW(None, "runas", script, None, None, 1)
+            else:
+                ShellExecuteW(None, "runas", sys.executable, f'"{script}"', None, 1)
     except Exception as e:
         logging.error(f"提权失败: {e}")
     return
