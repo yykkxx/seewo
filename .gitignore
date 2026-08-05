@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 构建产物
+dist/
+build/
+*.spec
+
+# 运行日志 / 状态
+*.log
+.seewo_guard_state.json
+.seewo_guard_state.json.tmp
+
+# IDE
+.vscode/
+.idea/
