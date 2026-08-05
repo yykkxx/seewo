@@ -36,6 +36,8 @@ def _output_name():
     return os.environ.get("SEEWO_OUTPUT", "SeewoGuard")
 
 
+
+
 def build_pyinstaller():
     _ensure_assets()
     name = _output_name()
@@ -44,7 +46,9 @@ def build_pyinstaller():
         "--noconfirm", "--onefile", "--noconsole", "--uac-admin",
         "--name", name,
         "--hidden-import=psutil",
-        "--collect-all", "PySide6",
+        "--hidden-import=PySide6.QtCore",
+        "--hidden-import=PySide6.QtGui",
+        "--hidden-import=PySide6.QtWidgets",
         "--icon", os.path.join(HERE, "icon.ico"),
         "--add-data", f"{os.path.join(HERE, 'icon.ico')};.",
         "--add-binary", f"{os.path.join(HERE, 'uiaccess.dll')};.",

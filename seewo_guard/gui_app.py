@@ -41,7 +41,7 @@ from seewo_guard.win_api import (
 )
 from ctypes import wintypes as _wintypes
 from seewo_guard.logging_system import (
-    setup_logging, shutdown_logging, LogBox, GUILogHandler,
+    setup_logging, shutdown_logging, attach_log_box, LogBox,
 )
 from seewo_guard.protection import get_protection
 from seewo_guard.ipc import IpcClient
@@ -83,13 +83,15 @@ class GuardWindow(QWidget):
         self.setAttribute(Qt.WA_DeleteOnClose, False)
         self.setAttribute(Qt.WA_QuitOnClose, False)
 
-        self.vd = VirtualDesktopManager()
+        self.vd = VirtualDesktopManager(lazy=True)  # COM 探测延迟到窗口显示后
 
         self._build_ui()
         self._connect_signals()
         self._register_hotkeys()
         self._setup_tray()
-        self._apply_self_affinity()
+
+        # 重活延迟到窗口显示后 (首帧不阻塞)
+        QTimer.singleShot(0, self._deferred_init)
 
         # 心跳 / 状态轮询
         self.ipc_timer = QTimer(self)
@@ -109,11 +111,6 @@ class GuardWindow(QWidget):
             logging.warning(f"[测试模式] {TEST_AUTO_QUIT_MS}ms 后自动退出")
             QTimer.singleShot(TEST_AUTO_QUIT_MS, self._request_quit)
 
-        # GUI 自身保护
-        try:
-            get_protection().enable()
-        except Exception as e:
-            logging.error(f"GUI 自身保护启用失败: {e}")
 
         # 首次心跳
         QTimer.singleShot(300, self._send_hello)
@@ -121,6 +118,22 @@ class GuardWindow(QWidget):
         logging.info("🛡️ 界面进程启动完成 (守护进程独立运行)")
         logging.info("💡 关闭窗口 = 收缩到托盘 | 只有「完全退出」才退出")
         logging.info("💡 热键: Ctrl+Alt+Y=显示 | Ctrl+Alt+K=杀进程 | Ctrl+Alt+Q=退出")
+
+    # ==========================================
+    # 延迟初始化 (窗口显示后执行, 不阻塞首帧)
+    # ==========================================
+    def _deferred_init(self):
+        """窗口显示后执行的重活: 虚拟桌面 COM / 进程保护 / 自身防录屏"""
+        try:
+            self.vd.ensure_ready()
+            self._refresh_desktops()
+        except Exception as e:
+            logging.debug(f"虚拟桌面延迟初始化失败: {e}")
+        try:
+            get_protection().enable()
+        except Exception as e:
+            logging.error(f"GUI 自身保护启用失败: {e}")
+        self._apply_self_affinity()
 
     # ==========================================
     # UI
@@ -139,7 +152,6 @@ class GuardWindow(QWidget):
 
         self.lbl_desk = QLabel("桌面:")
         self.cmb_desk = QComboBox()
-        self._refresh_desktops()
         self.btn_move_desk = QPushButton("移动")
         self.btn_new_desk = QPushButton("新建桌面并移动")
 
@@ -154,6 +166,8 @@ class GuardWindow(QWidget):
         self.lbl_hint.setStyleSheet("color:#888;font-size:11px;")
 
         self.log_box = LogBox()
+        attach_log_box(self.log_box)          # 实时日志进框
+        self.log_box.load_recent(GUI_LOG)     # 启动回显历史日志
 
         lay = QVBoxLayout()
         lay.setSpacing(8)
@@ -605,6 +619,7 @@ class GuardWindow(QWidget):
 def gui_main():
     hide_console()
     setup_logging(GUI_LOG)
+    _t0 = time.monotonic()
 
     logging.info("=" * 60)
     logging.info(f"  SeewoGuard GUI 进程 v{getattr(__import__('seewo_guard.config'), 'VERSION', '4.0')}")
@@ -658,16 +673,24 @@ def gui_main():
         shutdown_logging()
         sys.exit(0)
 
-    # ---------- 确保守护进程运行 ----------
+    # ---------- 确保守护进程运行 (后台执行, 不阻塞窗口显示) ----------
     client = IpcClient()
-    if not client.request({"cmd": "status"}):
-        logging.info("🚀 守护进程未运行, 正在拉起...")
-        spawn_hidden(daemon_cmd())
-        # 等待守护进程就绪 (最多 8 秒)
-        for _ in range(16):
-            time.sleep(0.5)
+
+    def _ensure_daemon_async():
+        try:
             if client.request({"cmd": "status"}):
-                break
+                return
+            logging.info("🚀 守护进程未运行, 正在拉起...")
+            spawn_hidden(daemon_cmd())
+            # 后台等待就绪 (最多 3 秒), 未就绪由心跳轮询兜底
+            for _ in range(6):
+                time.sleep(0.5)
+                if client.request({"cmd": "status"}):
+                    return
+        except Exception:
+            pass
+
+    threading.Thread(target=_ensure_daemon_async, daemon=True).start()
 
     # ---------- GUI ----------
     from PySide6.QtWidgets import QApplication
@@ -676,7 +699,8 @@ def gui_main():
 
     win = GuardWindow(client, lock)
     win.show()
-    logging.info(f"🚀 GUI 启动完成 (PID={os.getpid()})")
+    logging.info(f"🚀 GUI 启动完成 (PID={os.getpid()}, "
+                 f"启动耗时 {time.monotonic() - _t0:.2f}s)")
 
     exit_code = 0
     try:

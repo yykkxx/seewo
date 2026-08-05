@@ -42,11 +42,6 @@ codex/
     ├── gui_app.py             # GUI 进程 (托盘/热键/功能)
     ├── keyboard.py            # 全局键盘监听 (WH_KEYBOARD_LL 钩子)
     └── window_ops.py          # 窗口/杀进程/防录屏/禁网/虚拟桌面
-
-cpp/
-├── main.cpp                  # C++ 版 (托盘/钩子/杀进程/COM虚拟桌面/守护)
-├── icon.rc / app.manifest    # 图标与管理员清单
-└── build_cpp.ps1             # C++ 打包脚本 (cl.exe, /MT 静态单文件)
 ```
 
 ## 运行
@@ -105,8 +100,8 @@ python -m nuitka --onefile --windows-disable-console --windows-uac-admin ^
 
 | 打包器 | 产物 | 体积 | 说明 |
 | --- | --- | --- | --- |
-| PyInstaller | `dist\SeewoGuard.exe` | ~240 MB | 启动稍慢 (onefile 解压) |
-| Nuitka | `dist\SeewoGuard_nuitka.exe` | ~70 MB | 启动快, 体积小 |
+| PyInstaller | `dist\SeewoGuard.exe` | ~43 MB | 仅打包实际导入的 Qt 模块 |
+| Nuitka | `dist\SeewoGuard_nuitka.exe` | ~69 MB | 启动快, 体积小 |
 
 > Nuitka 兼容说明: Nuitka 不设置 `sys.frozen`, 代码用 `__compiled__`
 > 识别编译产物; onefile 下 `sys.executable` 指向临时解压目录,
@@ -153,28 +148,20 @@ python -m nuitka --onefile --windows-disable-console --windows-uac-admin ^
 - GUI 心跳丢失后守护进程**立即重启 GUI** (不再等待长宽限期)。
 - 守护进程启动后 6 秒内等待 GUI 注册, 未注册则主动拉起; 心跳超时阈值 4 秒。
 
-## C++ 版 (SeewoGuardCpp)
+## GUI 日志框
 
-纯 Win32/C++ 单文件实现, 功能与 Python 版对齐:
+- 主界面内置彩色日志框 (限 5000 行): 启动时回显日志文件末尾 300 行历史,
+  之后实时滚动显示全部日志。
+- 日志文件: `seewo_guard_gui.log` / `seewo_guard_daemon.log` (exe 目录)。
 
-- 双进程架构 (GUI + `--daemon` 守护), 命名管道 IPC + 心跳
-- 托盘图标 / X 收缩到托盘 / 只有「完全退出」才退出
-- `WH_KEYBOARD_LL` 键盘钩子 (Ctrl+Alt+Y/K/Q)
-- 杀进程 (`TerminateProcess`, 按完整路径匹配)
-- 虚拟桌面 (纯 COM, 与 Python 版相同的 vtable 布局探测, 兼容 Win10/Win11)
-- 守护进程监听关机 (WM_QUERYENDSESSION), GUI 被杀后自动重启 (最多 5 次)
+## 启动加速
 
-构建 (需 VS 2022 Build Tools, 含 C++ 工作负载):
-
-```powershell
-cd C:\yykkxx\code\seewo\codex\cpp
-powershell -ExecutionPolicy Bypass -File build_cpp.ps1
-# -> ..\dist\SeewoGuardCpp.exe  (~270 KB, /MT 静态, 单文件无依赖)
-```
-
-运行方式与 Python 版一致: 双击即 GUI 模式, `SeewoGuardCpp.exe --daemon` 守护模式;
-测试用 `SeewoGuardCpp.exe --test-auto-quit` (4 秒后自动完全退出)。
-日志: `dist\seewo_guard_cpp.log`。
+- 守护进程在后台拉起, 窗口**立即显示**, 不再阻塞等待守护就绪
+  (未就绪时由心跳轮询自动兜底)。
+- 虚拟桌面 COM 探测 / 进程保护 / 自身防录屏延迟到窗口显示后执行。
+- PyInstaller 不再 `--collect-all PySide6`, 只打包实际导入的
+  QtCore/QtGui/QtWidgets 模块 (体积 240MB -> 43MB, 解压启动更快)。
+- 实测: GUI 启动耗时 PyInstaller 版 ~0.4s / Nuitka 版 ~0.3s。
 
 ## 测试模式 (开发用)
 

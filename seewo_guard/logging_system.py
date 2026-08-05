@@ -6,6 +6,7 @@ logging_system.py - 日志系统
 - setup_logging / shutdown_logging
 """
 import os
+import re
 import threading
 import logging
 from datetime import datetime
@@ -111,6 +112,25 @@ def setup_logging(log_file, log_box=None, level=logging.DEBUG):
     logging.info("=" * 60)
 
 
+_gui_handler_ref = None
+
+
+def attach_log_box(log_box):
+    """把 GUI 日志框挂到 root logger (幂等, 可重复调用)"""
+    global _gui_handler_ref
+    if GUILogHandler is None or log_box is None:
+        return
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        if isinstance(h, GUILogHandler):
+            root.removeHandler(h)
+    gh = GUILogHandler(log_box)
+    gh.setFormatter(logging.Formatter('%(message)s'))
+    gh.setLevel(logging.DEBUG)
+    root.addHandler(gh)
+    _gui_handler_ref = gh  # 持有引用, 防止被 GC
+
+
 def shutdown_logging():
     global _logger_initialized
     root = logging.getLogger()
@@ -188,6 +208,33 @@ if HAS_QT:
 
         def append_log(self, level, msg):
             self._sig.log_signal.emit(level, msg)
+
+        _LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+
+        def load_recent(self, log_file, max_lines=300):
+            """把日志文件末尾若干行显示到日志框 (启动即可见历史)"""
+            try:
+                with open(log_file, 'r', encoding='utf-8',
+                          errors='replace') as f:
+                    lines = f.readlines()[-max_lines:]
+            except OSError:
+                return
+            for line in lines:
+                line = line.rstrip('\r\n')
+                if not line.strip():
+                    continue
+                level = "INFO"
+                msg = line
+                m = re.match(
+                    r'^\S+ \S+ \[(\w+)\s*\] \[[^\]]*\] (.*)$', line)
+                if m:
+                    if m.group(1) in self._LEVELS:
+                        level = m.group(1)
+                    msg = m.group(2)
+                try:
+                    self._append_log(level, msg)
+                except Exception:
+                    pass
 
     class GUILogHandler(logging.Handler):
         """将 logging 记录转发到 LogBox"""

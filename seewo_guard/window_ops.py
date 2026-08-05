@@ -248,10 +248,20 @@ class VirtualDesktopManager:
 
     _ZERO_GUID = "{00000000-0000-0000-0000-000000000000}"
 
-    def __init__(self):
+    def __init__(self, lazy=False):
         self._ole32 = None
         self._avail = False
-        self._init()
+        self._ready = False
+        if not lazy:
+            self._init()
+            self._ready = True
+
+    def ensure_ready(self):
+        """惰性初始化 (幂等): 首次调用时执行 COM 探测"""
+        if not self._ready:
+            self._ready = True
+            self._init()
+        return self._avail
 
     def _init(self):
         try:
@@ -269,6 +279,7 @@ class VirtualDesktopManager:
             self._avail = False
 
     def is_available(self):
+        self.ensure_ready()
         return self._avail
 
     # ---------- COM 基础 ----------
@@ -337,7 +348,9 @@ class VirtualDesktopManager:
         """ImmersiveShell 服务 -> QueryService 探测 IVirtualDesktopManagerInternal
 
         返回 (mgr_ptr, slots) 或 None; 布局按首个 QueryService 成功的 IID 确定
+        注意: 本方法是所有 COM 调用的总入口, 先确保惰性初始化完成
         """
+        self.ensure_ready()
         import sys
         build = sys.getwindowsversion().build
         svc = self._co_create(self._CLSID_IMMERSIVE_SHELL,
