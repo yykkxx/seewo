@@ -23,9 +23,13 @@ advapi32 = ctypes.windll.advapi32
 # ==========================================
 HWND_TOPMOST = -1
 HWND_NOTOPMOST = -2
+HWND_BOTTOM = 1
 SWP_NOMOVE = 0x0002
 SWP_NOSIZE = 0x0001
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
 SWP_SHOWWINDOW = 0x0040
+SWP_ASYNCWINDOWPOS = 0x4000
 
 SetWindowPos = user32.SetWindowPos
 SetWindowPos.argtypes = [
@@ -40,10 +44,34 @@ SetWindowPos.restype = wintypes.BOOL
 ShowWindow = user32.ShowWindow
 ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
 ShowWindow.restype = wintypes.BOOL
+ShowWindowAsync = user32.ShowWindowAsync
+ShowWindowAsync.argtypes = [wintypes.HWND, ctypes.c_int]
+ShowWindowAsync.restype = wintypes.BOOL
 SW_HIDE = 0
 SW_SHOW = 5
+SW_MAXIMIZE = 3
 SW_RESTORE = 9
 SW_MINIMIZE = 6
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+MONITOR_DEFAULTTONEAREST = 2
+
+MonitorFromWindow = user32.MonitorFromWindow
+MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+MonitorFromWindow.restype = wintypes.HMONITOR
+
+GetMonitorInfoW = user32.GetMonitorInfoW
+GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(MONITORINFO)]
+GetMonitorInfoW.restype = wintypes.BOOL
 
 GetConsoleWindow = kernel32.GetConsoleWindow
 GetConsoleWindow.restype = wintypes.HWND
@@ -225,6 +253,10 @@ GetWindowThreadProcessId.restype = wintypes.DWORD
 IsWindowVisible = user32.IsWindowVisible
 IsWindowVisible.argtypes = [wintypes.HWND]
 IsWindowVisible.restype = wintypes.BOOL
+
+IsIconic = user32.IsIconic
+IsIconic.argtypes = [wintypes.HWND]
+IsIconic.restype = wintypes.BOOL
 
 SetForegroundWindow = user32.SetForegroundWindow
 SetForegroundWindow.argtypes = [wintypes.HWND]

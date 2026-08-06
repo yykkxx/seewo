@@ -10,6 +10,8 @@ import shutil
 import subprocess
 import sys
 
+from seewo_guard.config import VERSION
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -44,6 +46,7 @@ def build_pyinstaller():
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--onefile", "--noconsole", "--uac-admin",
+        "--optimize=1",
         "--name", name,
         "--hidden-import=psutil",
         "--hidden-import=PySide6.QtCore",
@@ -68,8 +71,11 @@ def build_nuitka():
     cmd = [
         sys.executable, "-m", "nuitka",
         "--onefile",
-        "--windows-disable-console",
+        "--windows-console-mode=disable",
         "--windows-uac-admin",
+        f"--onefile-tempdir-spec={{CACHE_DIR}}/SeewoGuard/{VERSION}",
+        "--onefile-cache-mode=cached",
+        "--onefile-no-compression",
         "--enable-plugin=pyside6",
         f"--windows-icon-from-ico={os.path.join(HERE, 'icon.ico')}",
         "--include-package=psutil",

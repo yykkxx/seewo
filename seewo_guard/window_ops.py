@@ -18,14 +18,29 @@ import psutil
 from seewo_guard.config import TARGET_EXES
 from seewo_guard.win_api import (
     user32, kernel32,
-    EnumWindows, GetWindowThreadProcessId, IsWindowVisible, WNDENUMPROC,
+    EnumWindows, GetWindowThreadProcessId, IsWindowVisible, IsIconic,
+    WNDENUMPROC,
     SetWindowDisplayAffinity, GetWindowDisplayAffinity,
     WDA_NONE, WDA_MONITOR, WDA_EXCLUDEFROMCAPTURE,
     HAS_SETWINDOWBAND, SetWindowBand,
+    SetWindowPos, ShowWindowAsync, SetForegroundWindow,
+    HWND_TOPMOST, HWND_BOTTOM,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE,
+    SWP_SHOWWINDOW, SWP_ASYNCWINDOWPOS,
+    SW_MINIMIZE, SW_RESTORE, SW_MAXIMIZE,
+    MonitorFromWindow, GetMonitorInfoW, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST,
     wintypes,
 )
 from ctypes import wintypes as _wintypes
-from seewo_guard.utils import hidden_startupinfo, hidden_creationflags
+from seewo_guard.utils import (
+    hidden_startupinfo, hidden_creationflags, spawn_hidden,
+)
+
+
+COMPACT_WINDOW_WIDTH = 360
+COMPACT_WINDOW_HEIGHT = 220
+COMPACT_WINDOW_MARGIN = 8
 
 # ==========================================
 # PID 缓存 (按 exe 路径 -> [pids])
@@ -102,6 +117,116 @@ def find_all_windows_by_path(exe_path, visible=True):
     return hwnds
 
 
+def find_all_target_windows(visible=False):
+    """返回全部希沃目标窗口，单轮枚举并按目标 PID 匹配。"""
+    target_pids = set()
+    for exe_path in TARGET_EXES:
+        target_pids.update(get_pids_by_path(exe_path))
+    if not target_pids:
+        return []
+    groups = _enumerate_windows_grouped(visible_only=visible)
+    hwnds = []
+    for pid in target_pids:
+        hwnds.extend(groups.get(pid, []))
+    return list(dict.fromkeys(hwnds))
+
+
+def launch_main_target():
+    """确保主希沃进程正在运行，返回其 PID；失败返回 0。"""
+    main_exe = TARGET_EXES[-1]
+    if not os.path.exists(main_exe):
+        logging.error(f"拉起希沃失败，文件不存在: {main_exe}")
+        return 0
+    existing_pids = get_pids_by_path(main_exe)
+    if existing_pids:
+        maximize_target_windows(force_topmost=True)
+        logging.info(f"希沃已在运行: PID={existing_pids[0]}")
+        return existing_pids[0]
+    proc = spawn_hidden([main_exe])
+    if not proc:
+        logging.error("拉起希沃失败")
+        return 0
+    clear_pid_cache()
+    logging.info(f"已拉起希沃: PID={proc.pid}")
+    return proc.pid
+
+
+def compact_target_windows(width=COMPACT_WINDOW_WIDTH,
+                           height=COMPACT_WINDOW_HEIGHT):
+    """把全部希沃窗口恢复为小窗口并放到所在屏幕右上角。"""
+    changed = 0
+    for hwnd in find_all_target_windows(visible=True):
+        try:
+            monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+            info = MONITORINFO()
+            info.cbSize = ctypes.sizeof(info)
+            if not monitor or not GetMonitorInfoW(monitor, ctypes.byref(info)):
+                continue
+            work = info.rcWork
+            target_width = min(width, max(1, work.right - work.left))
+            target_height = min(height, max(1, work.bottom - work.top))
+            x = work.right - target_width - COMPACT_WINDOW_MARGIN
+            y = work.top + COMPACT_WINDOW_MARGIN
+            ShowWindowAsync(hwnd, SW_RESTORE)
+            if SetWindowPos(
+                    hwnd, 0, x, y, target_width, target_height,
+                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW
+                    | SWP_ASYNCWINDOWPOS):
+                changed += 1
+        except Exception as e:
+            logging.debug(f"修改希沃窗口大小失败 hwnd={hwnd}: {e}")
+    logging.info(f"已把 {changed} 个希沃窗口缩小到右上角")
+    return changed
+
+
+def maximize_target_windows(force_topmost=False):
+    """最大化全部希沃窗口，可选同时置顶。"""
+    changed = 0
+    hwnds = find_all_target_windows(visible=True)
+    for hwnd in hwnds:
+        try:
+            ShowWindowAsync(hwnd, SW_MAXIMIZE)
+            if force_topmost:
+                SetWindowPos(
+                    hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+                    | SWP_ASYNCWINDOWPOS)
+            changed += 1
+        except Exception as e:
+            logging.debug(f"最大化希沃窗口失败 hwnd={hwnd}: {e}")
+    if force_topmost and hwnds:
+        try:
+            SetForegroundWindow(hwnds[0])
+        except Exception:
+            pass
+    logging.info(f"已最大化 {changed} 个希沃窗口"
+                 f"{'并置顶' if force_topmost else ''}")
+    return changed
+
+
+def minimize_target_windows_to_bottom(log_result=True):
+    """最小化并置底全部希沃窗口，返回处理的窗口数。
+
+    该操作由 GUI 的短周期定时器持续调用，用本程序的 UIAccess 权限
+    压过目标程序每秒一次的置顶动作，避免注入或挂起线程留下冻结状态。
+    """
+    changed = 0
+    for hwnd in find_all_target_windows(visible=True):
+        try:
+            if not IsIconic(hwnd):
+                ShowWindowAsync(hwnd, SW_MINIMIZE)
+            SetWindowPos(
+                hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+                | SWP_ASYNCWINDOWPOS)
+            changed += 1
+        except Exception:
+            pass
+    if log_result:
+        logging.info(f"已最小化置底 {changed} 个希沃窗口")
+    return changed
+
+
 def set_window_display_affinity_all(exe_path, affinity=WDA_MONITOR):
     """对指定 exe 的所有窗口设置显示亲和性, 返回成功数"""
     count = 0
@@ -151,10 +276,14 @@ def force_kill_process(pid):
         pass
 
 
-def kill_pass():
-    """对全部目标进程执行一轮击杀"""
+def kill_pass(stop_event=None):
+    """对全部目标进程执行一轮击杀，可由事件提前中断。"""
     for p in TARGET_EXES:
+        if stop_event is not None and stop_event.is_set():
+            break
         for pid in get_pids_by_path(p):
+            if stop_event is not None and stop_event.is_set():
+                break
             force_kill_process(pid)
     clear_pid_cache()
 
@@ -711,4 +840,3 @@ class VirtualDesktopManager:
         except Exception as e:
             logging.error(f"新建桌面失败: {e}")
         return -1, 0
-

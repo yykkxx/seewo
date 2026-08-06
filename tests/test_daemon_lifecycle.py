@@ -28,8 +28,10 @@ time.sleep(3)
 from seewo_guard.ipc import IpcClient
 c = IpcClient()
 print("STATUS:", c.request({"cmd": "status"}))
+print("BOTTOM ON:", c.request({"cmd": "set_target_bottom", "enabled": True}))
 print("GUI_HELLO:", c.request({"cmd": "gui_hello", "pid": 12345}))
 print("STATUS2:", c.request({"cmd": "status"}))
+print("BOTTOM OFF:", c.request({"cmd": "set_target_bottom", "enabled": False}))
 print("SHUTDOWN:", c.request({"cmd": "shutdown", "pid": 12345}))
 
 time.sleep(2)

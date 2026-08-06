@@ -214,9 +214,21 @@ if HAS_QT:
         def load_recent(self, log_file, max_lines=300):
             """把日志文件末尾若干行显示到日志框 (启动即可见历史)"""
             try:
-                with open(log_file, 'r', encoding='utf-8',
-                          errors='replace') as f:
-                    lines = f.readlines()[-max_lines:]
+                with open(log_file, 'rb') as f:
+                    f.seek(0, 2)
+                    position = f.tell()
+                    chunks = []
+                    newline_count = 0
+                    while position > 0 and newline_count <= max_lines:
+                        size = min(8192, position)
+                        position -= size
+                        f.seek(position)
+                        chunk = f.read(size)
+                        chunks.append(chunk)
+                        newline_count += chunk.count(b'\n')
+                    data = b''.join(reversed(chunks))
+                    lines = data.decode('utf-8', errors='replace').splitlines()
+                    lines = lines[-max_lines:]
             except OSError:
                 return
             for line in lines:

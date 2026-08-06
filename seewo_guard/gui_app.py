@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-gui_app.py - GUI 界面进程 (v4.0)
+gui_app.py - GUI 界面进程 (v4.1)
 
 职责:
   - 窗口 / 托盘 / 热键 / 功能按钮 (杀进程/取消置顶/防录屏/禁网/虚拟桌面)
@@ -19,14 +19,14 @@ import logging
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
-    QWidget, QPushButton, QVBoxLayout, QHBoxLayout,
+    QWidget, QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout,
     QComboBox, QLabel, QMessageBox, QStyle, QSystemTrayIcon, QMenu,
 )
 from PySide6.QtGui import QIcon, QAction, QTextCursor
 
 from seewo_guard.config import (
     APP_NAME, GUI_LOG, GUI_MUTEX, TARGET_EXES,
-    TEST_MODE, TEST_AUTO_QUIT_MS, resource_path,
+    STATE_FILE, TEST_AUTO_QUIT_MS, resource_path,
 )
 from seewo_guard.win_api import (
     user32, SetWindowPos, HWND_TOPMOST,
@@ -36,7 +36,6 @@ from seewo_guard.win_api import (
     WDA_EXCLUDEFROMCAPTURE, WDA_MONITOR, WDA_NONE,
     SetWindowDisplayAffinity, GetWindowDisplayAffinity,
     ShowWindow, SW_HIDE,
-    IsUserAnAdmin, IsUIAccess, StartUIAccessProcess,
     wintypes,
 )
 from ctypes import wintypes as _wintypes
@@ -48,11 +47,12 @@ from seewo_guard.ipc import IpcClient
 from seewo_guard.window_ops import (
     find_all_windows_by_path, set_window_display_affinity_all,
     set_zbid_and_notopmost, kill_pass, block_network, allow_network,
+    launch_main_target, compact_target_windows, maximize_target_windows,
+    minimize_target_windows_to_bottom,
     VirtualDesktopManager,
 )
 from seewo_guard.utils import (
-    get_self_path, get_session_id, hide_console, is_admin,
-    request_elevation, SingleInstanceLock, spawn_hidden,
+    get_session_id, hide_console, SingleInstanceLock, spawn_hidden,
     daemon_cmd, activate_window_of_pid, pid_alive,
 )
 
@@ -70,15 +70,19 @@ class GuardWindow(QWidget):
         self._net_blocked = False
         self._record_blocked = False
         self._killing = False
-        self._stop = threading.Event()
+        self._kill_stop = threading.Event()
+        self._record_stop = threading.Event()
         self._kill_thread = None
         self._record_thread = None
+        self._target_compact = False
+        self._target_minimized = False
+        self._target_bottom_pending = False
         self._tray = None
         self._top_ticks = 0
         self._unregister_hotkey = None
 
         self.setWindowTitle(APP_NAME)
-        self.resize(460, 470)
+        self.resize(640, 520)
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_DeleteOnClose, False)
         self.setAttribute(Qt.WA_QuitOnClose, False)
@@ -90,8 +94,9 @@ class GuardWindow(QWidget):
         self._register_hotkeys()
         self._setup_tray()
 
-        # 重活延迟到窗口显示后 (首帧不阻塞)
-        QTimer.singleShot(0, self._deferred_init)
+        # 重活错开执行，先让首帧和按钮可见。
+        QTimer.singleShot(100, self._deferred_init)
+        QTimer.singleShot(250, self._load_recent_logs)
 
         # 心跳 / 状态轮询
         self.ipc_timer = QTimer(self)
@@ -102,6 +107,10 @@ class GuardWindow(QWidget):
         self.top_timer = QTimer(self)
         self.top_timer.timeout.connect(self.keep_on_top)
         self.top_timer.start(1000)
+
+        self.target_bottom_timer = QTimer(self)
+        self.target_bottom_timer.timeout.connect(self._keep_target_minimized_bottom)
+        self.target_bottom_timer.setInterval(250)
 
         # 自动启动防录屏
         QTimer.singleShot(1200, self._auto_start_record_protect)
@@ -117,7 +126,8 @@ class GuardWindow(QWidget):
 
         logging.info("🛡️ 界面进程启动完成 (守护进程独立运行)")
         logging.info("💡 关闭窗口 = 收缩到托盘 | 只有「完全退出」才退出")
-        logging.info("💡 热键: Ctrl+Alt+Y=显示 | Ctrl+Alt+K=杀进程 | Ctrl+Alt+Q=退出")
+        logging.info("💡 热键: Ctrl+Alt+Y=显示 | Ctrl+Alt+K=杀进程 | "
+                     "Ctrl+Alt+Q=恢复希沃并退出")
 
     # ==========================================
     # 延迟初始化 (窗口显示后执行, 不阻塞首帧)
@@ -135,6 +145,9 @@ class GuardWindow(QWidget):
             logging.error(f"GUI 自身保护启用失败: {e}")
         self._apply_self_affinity()
 
+    def _load_recent_logs(self):
+        self.log_box.load_recent(GUI_LOG)
+
     # ==========================================
     # UI
     # ==========================================
@@ -143,6 +156,9 @@ class GuardWindow(QWidget):
         self.btn_kill_once = QPushButton("⚔️ 杀死进程 (单次)")
         self.btn_unpin = QPushButton("📌 取消置顶")
         self.btn_kill_forever = QPushButton("🔄 持续杀进程")
+        self.btn_launch_target = QPushButton("▶ 拉起希沃")
+        self.btn_resize_target = QPushButton("修改大小")
+        self.btn_minimize_bottom = QPushButton("最小化置底")
         self.btn_block_record = QPushButton("🔒 防录屏")
 
 
@@ -162,23 +178,28 @@ class GuardWindow(QWidget):
 
         self.lbl_hint = QLabel(
             "关闭窗口=收缩到托盘 | 只有「完全退出」才退出程序\n"
-            "热键: Ctrl+Alt+Y=显示 | Ctrl+Alt+K=杀进程 | Ctrl+Alt+Q=退出")
+            "热键: Ctrl+Alt+Y=显示 | Ctrl+Alt+K=杀进程 | "
+            "Ctrl+Alt+Q=恢复希沃并退出")
         self.lbl_hint.setStyleSheet("color:#888;font-size:11px;")
 
         self.log_box = LogBox()
         attach_log_box(self.log_box)          # 实时日志进框
-        self.log_box.load_recent(GUI_LOG)     # 启动回显历史日志
 
         lay = QVBoxLayout()
         lay.setSpacing(8)
 
-        r1 = QHBoxLayout()
-        r1.addWidget(self.btn_net)
-        r1.addWidget(self.btn_kill_once)
-        r1.addWidget(self.btn_unpin)
-        r1.addWidget(self.btn_kill_forever)
-        r1.addWidget(self.btn_block_record)
-        lay.addLayout(r1)
+        actions = QGridLayout()
+        actions.setHorizontalSpacing(8)
+        actions.setVerticalSpacing(8)
+        actions.addWidget(self.btn_net, 0, 0)
+        actions.addWidget(self.btn_kill_once, 0, 1)
+        actions.addWidget(self.btn_kill_forever, 0, 2)
+        actions.addWidget(self.btn_launch_target, 0, 3)
+        actions.addWidget(self.btn_unpin, 1, 0)
+        actions.addWidget(self.btn_resize_target, 1, 1)
+        actions.addWidget(self.btn_minimize_bottom, 1, 2)
+        actions.addWidget(self.btn_block_record, 1, 3)
+        lay.addLayout(actions)
 
         r2 = QHBoxLayout()
         r2.addWidget(self.lbl_daemon)
@@ -202,6 +223,9 @@ class GuardWindow(QWidget):
         self.btn_kill_once.clicked.connect(self.on_kill_once)
         self.btn_unpin.clicked.connect(self.on_unpin)
         self.btn_kill_forever.clicked.connect(self.on_kill_forever)
+        self.btn_launch_target.clicked.connect(self.on_launch_target)
+        self.btn_resize_target.clicked.connect(self.on_resize_target)
+        self.btn_minimize_bottom.clicked.connect(self.on_minimize_bottom)
         self.btn_block_record.clicked.connect(self.on_block_record_toggle)
         self.btn_move_desk.clicked.connect(self.on_move_desktop)
         self.btn_new_desk.clicked.connect(self.on_new_desktop)
@@ -250,7 +274,7 @@ class GuardWindow(QWidget):
                 elif hid == 2:
                     threading.Thread(target=kill_pass, daemon=True).start()
                 elif hid == 3:
-                    self.on_full_quit()
+                    self.on_hotkey_quit()
                 return True, 0
             if msg.message == WM_QUERYENDSESSION:
                 logging.warning("⚠️ 系统关机/注销 (守护进程将安全退出)")
@@ -336,6 +360,8 @@ class GuardWindow(QWidget):
         if resp:
             logging.info(f"👋 已向守护进程注册 (PID={os.getpid()})")
             self._daemon_down = False
+            self._sync_target_bottom_from_daemon(
+                bool(resp.get("target_bottom", False)))
         return resp
 
     def _ipc_tick(self):
@@ -357,6 +383,14 @@ class GuardWindow(QWidget):
 
         status = self._client.request({"cmd": "status"})
         if status:
+            if self._target_bottom_pending:
+                synced = self._client.request({
+                    "cmd": "set_target_bottom",
+                    "enabled": self._target_minimized,
+                })
+                if synced and synced.get("ok"):
+                    self._target_bottom_pending = False
+                    status["target_bottom"] = self._target_minimized
             self._update_daemon_status(status)
 
     def _set_daemon_down(self):
@@ -370,6 +404,8 @@ class GuardWindow(QWidget):
 
     def _update_daemon_status(self, status):
         pid = status.get("pid", 0)
+        self._sync_target_bottom_from_daemon(
+            bool(status.get("target_bottom", False)))
 
         if pid_alive(pid):
             self.lbl_daemon_status.setText(f"运行中 (PID={pid})")
@@ -394,34 +430,83 @@ class GuardWindow(QWidget):
         if not self._killing:
             logging.info("🔄 持续杀进程 ON")
             self._killing = True
-            self._stop.clear()
+            self._kill_stop.clear()
             self._kill_thread = threading.Thread(target=self._kill_loop, daemon=True)
             self._kill_thread.start()
             self.btn_kill_forever.setText("⏹️ 停止杀进程")
             self.btn_kill_forever.setStyleSheet("color:darkred;font-weight:bold;")
         else:
+            self._stop_killing(launch_target=True)
+
+    def _stop_killing(self, launch_target=False):
+        if self._killing:
             logging.info("⏹️ 持续杀进程 OFF")
             self._killing = False
-            self._stop.set()
-            if self._kill_thread:
-                self._kill_thread.join(timeout=2)
-            self.btn_kill_forever.setText("🔄 持续杀进程")
-            self.btn_kill_forever.setStyleSheet("")
-            main_exe = TARGET_EXES[-1]
-            if os.path.exists(main_exe):
-                try:
-                    from seewo_guard.utils import hidden_startupinfo, hidden_creationflags
-                    import subprocess
-                    subprocess.Popen([main_exe], startupinfo=hidden_startupinfo(),
-                                     creationflags=hidden_creationflags())
-                    logging.info("已恢复应用")
-                except Exception as e:
-                    logging.error(f"恢复失败: {e}")
+            self._kill_stop.set()
+            if self._kill_thread and self._kill_thread.is_alive():
+                self._kill_thread.join(timeout=1.2)
+        self.btn_kill_forever.setText("🔄 持续杀进程")
+        self.btn_kill_forever.setStyleSheet("")
+        if launch_target:
+            launch_main_target()
+
+    def on_launch_target(self):
+        """停止持续击杀后拉起主希沃进程。"""
+        self._stop_killing(launch_target=True)
+
+    def on_resize_target(self):
+        if self._target_minimized:
+            self._set_target_bottom_mode(False, maximize=False)
+        if not self._target_compact:
+            if compact_target_windows() > 0:
+                self._target_compact = True
+                self.btn_resize_target.setText("最大化")
+        else:
+            if maximize_target_windows() > 0:
+                self._target_compact = False
+                self.btn_resize_target.setText("修改大小")
+
+    def on_minimize_bottom(self):
+        self._set_target_bottom_mode(
+            not self._target_minimized, maximize=self._target_minimized)
+
+    def _keep_target_minimized_bottom(self):
+        if self._target_minimized:
+            minimize_target_windows_to_bottom(log_result=False)
+
+    def _apply_target_bottom_local(self, enabled, maximize=False):
+        if enabled:
+            self._target_minimized = True
+            self.btn_minimize_bottom.setText("最大化置顶")
+            minimize_target_windows_to_bottom()
+            if not self.target_bottom_timer.isActive():
+                self.target_bottom_timer.start()
+            return
+        was_enabled = self._target_minimized
+        self.target_bottom_timer.stop()
+        self._target_minimized = False
+        self.btn_minimize_bottom.setText("最小化置底")
+        if maximize and was_enabled:
+            maximize_target_windows(force_topmost=True)
+
+    def _set_target_bottom_mode(self, enabled, maximize=False):
+        self._apply_target_bottom_local(enabled, maximize=maximize)
+        resp = self._client.request({
+            "cmd": "set_target_bottom",
+            "enabled": enabled,
+        })
+        self._target_bottom_pending = not (resp and resp.get("ok"))
+
+    def _sync_target_bottom_from_daemon(self, enabled):
+        if self._target_bottom_pending or enabled == self._target_minimized:
+            return
+        self._apply_target_bottom_local(enabled, maximize=not enabled)
 
     def _kill_loop(self):
-        while not self._stop.is_set():
-            kill_pass()
-            time.sleep(0.8)
+        while not self._kill_stop.is_set():
+            kill_pass(self._kill_stop)
+            if self._kill_stop.wait(0.8):
+                break
 
     def on_unpin(self):
         logging.info("📌 取消置顶 (ZBID双重模式)")
@@ -452,7 +537,7 @@ class GuardWindow(QWidget):
                         total += 1
                 except Exception:
                     pass
-        self._stop.clear()
+        self._record_stop.clear()
         self._record_thread = threading.Thread(target=self._record_loop, daemon=True)
         self._record_thread.start()
         self._record_blocked = True
@@ -463,7 +548,7 @@ class GuardWindow(QWidget):
 
     def _disable_record_block(self):
         logging.info("🔓 关闭防录屏...")
-        self._stop.set()
+        self._record_stop.set()
         if self._record_thread:
             self._record_thread.join(timeout=2)
         for exe in TARGET_EXES:
@@ -475,7 +560,7 @@ class GuardWindow(QWidget):
 
     def _record_loop(self):
         """持续修复防录屏设置 (2秒一轮, 单次枚举)"""
-        while not self._stop.is_set():
+        while not self._record_stop.is_set():
             try:
                 for exe in TARGET_EXES:
                     for hwnd in find_all_windows_by_path(exe):
@@ -490,7 +575,8 @@ class GuardWindow(QWidget):
                             pass
             except Exception:
                 pass
-            time.sleep(2)
+            if self._record_stop.wait(2):
+                break
 
     def on_net_toggle(self):
         if not self._net_blocked:
@@ -550,14 +636,24 @@ class GuardWindow(QWidget):
         """完全退出 (不弹确认框, 直接安全退出)"""
         self._request_quit()
 
+    def on_hotkey_quit(self):
+        """Ctrl+Alt+Q: 停止杀进程，拉起希沃，再退出。"""
+        logging.info("Ctrl+Alt+Q: 停止杀进程并拉起希沃后退出")
+        self._stop_killing(launch_target=True)
+        self._request_quit()
+
     def _request_quit(self):
         """安全退出: 通知守护进程关闭, 然后退出本进程"""
         logging.info("👋 请求完全退出...")
         self._quitting = True  # 完全退出中: closeEvent 不再拦截
-        self._stop.set()
+        self._kill_stop.set()
+        self._record_stop.set()
         for t, name in [(self._kill_thread, "杀进程"), (self._record_thread, "防录屏")]:
             if t and t.is_alive():
                 t.join(timeout=1)
+
+        if self._target_minimized:
+            self._set_target_bottom_mode(False, maximize=True)
 
         # 通知守护进程退出
         resp = self._client.request({"cmd": "shutdown", "pid": os.getpid()})
@@ -580,6 +676,7 @@ class GuardWindow(QWidget):
             pass
 
         self.top_timer.stop()
+        self.target_bottom_timer.stop()
         self.ipc_timer.stop()
 
         if self._lock:
@@ -616,48 +713,15 @@ class GuardWindow(QWidget):
 # ==========================================
 # 入口
 # ==========================================
-def gui_main():
+def gui_main(started_at=None):
     hide_console()
     setup_logging(GUI_LOG)
-    _t0 = time.monotonic()
+    _t0 = started_at if started_at is not None else time.monotonic()
 
     logging.info("=" * 60)
-    logging.info(f"  SeewoGuard GUI 进程 v{getattr(__import__('seewo_guard.config'), 'VERSION', '4.0')}")
+    logging.info(f"  SeewoGuard GUI 进程 v{getattr(__import__('seewo_guard.config'), 'VERSION', '4.1')}")
     logging.info(f"  PID: {os.getpid()}  会话: {get_session_id()}")
     logging.info("=" * 60)
-
-    # ---------- 管理员权限 (测试模式跳过) ----------
-    if not TEST_MODE and not is_admin():
-        logging.info("⚡ 请求管理员权限...")
-        request_elevation()
-        shutdown_logging()
-        sys.exit(0)
-
-    # ---------- UIAccess 置顶穿透 (测试模式跳过) ----------
-    if not TEST_MODE and IsUIAccess is not None and not IsUIAccess(_wintypes.HANDLE(-1)):
-        if StartUIAccessProcess is not None:
-            script = get_self_path()
-            cmd = f'"{sys.executable}" "{script}"' if script.endswith('.py') else f'"{script}"'
-            logging.info("🔐 通过 UIAccess 启动新实例...")
-            try:
-                from seewo_guard.win_api import ProcessIdToSessionId, kernel32
-                from seewo_guard.utils import clean_env_context
-                sid = _wintypes.DWORD(0)
-                pid = _wintypes.DWORD(0)
-                kernel32.ProcessIdToSessionId(kernel32.GetCurrentProcessId(),
-                                              ctypes.byref(sid))
-                # 该 DLL 内部启动进程会继承环境, 需临时清掉打包器变量,
-                # 否则新实例 bootloader 误判继承关系导致 Python 启动失败
-                with clean_env_context():
-                    success = StartUIAccessProcess(None, cmd, 0,
-                                                   ctypes.byref(pid), sid.value)
-                if success:
-                    logging.info(f"✅ UIAccess 子进程已启动 PID={pid.value}")
-                    shutdown_logging()
-                    sys.exit(0)
-                logging.warning("UIAccess 启动失败, 降级运行")
-            except Exception as e:
-                logging.error(f"UIAccess 异常: {e}, 降级运行")
 
     # ---------- 单实例 ----------
     lock = SingleInstanceLock(GUI_MUTEX)
@@ -665,11 +729,8 @@ def gui_main():
         logging.info("检测到已有界面进程, 激活其窗口")
         try:
             import json
-            if os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                           '..', '.seewo_guard_state.json')):
-                with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                       '..', '.seewo_guard_state.json'),
-                          'r', encoding='utf-8') as f:
+            if os.path.exists(STATE_FILE):
+                with open(STATE_FILE, 'r', encoding='utf-8') as f:
                     state = json.load(f)
                 activate_window_of_pid(state.get("gui_pid", 0))
         except Exception:
@@ -719,8 +780,3 @@ def gui_main():
             pass
         shutdown_logging()
     sys.exit(exit_code)
-
-
-
-
-

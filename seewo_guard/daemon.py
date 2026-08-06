@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-daemon.py - 守护进程 (v4.0 双进程架构核心)
+daemon.py - 守护进程 (v4.1 双进程架构核心)
 
 职责:
   1. 无界面常驻后台, 独立于 GUI 进程 (任务管理器结束 GUI 不影响守护)
@@ -56,6 +56,8 @@ class DaemonApp:
         self._ipc = None
         self._protection = get_protection()
         self._start_time = time.monotonic()
+        self._state_lock = threading.Lock()
+        self._target_bottom = False
 
         # GUI 看护状态
         self._gui_pid = 0
@@ -163,6 +165,7 @@ class DaemonApp:
                 "version": VERSION,
                 "gui_pid": self._gui_pid,
                 "restart_count": self._restart_count,
+                "target_bottom": self._target_bottom,
                 "uptime": round(time.monotonic() - self._start_time, 1),
             }
 
@@ -174,7 +177,11 @@ class DaemonApp:
             self._expecting_pid = None
             logging.info(f"👋 GUI 已连接 (PID={pid})")
             self._write_state()
-            return {"ok": True, "gui_pid": pid}
+            return {
+                "ok": True,
+                "gui_pid": pid,
+                "target_bottom": self._target_bottom,
+            }
 
         if cmd == "gui_alive":
             pid = int(req.get("pid", 0) or 0)
@@ -182,6 +189,14 @@ class DaemonApp:
                 self._gui_pid = pid
                 self._last_hb = time.monotonic()
             return {"ok": True}
+
+        if cmd == "set_target_bottom":
+            enabled = bool(req.get("enabled", False))
+            if enabled != self._target_bottom:
+                self._target_bottom = enabled
+                logging.info(f"窗口置底状态: {'开启' if enabled else '关闭'}")
+                self._write_state()
+            return {"ok": True, "target_bottom": self._target_bottom}
 
         if cmd == "shutdown":
             logging.warning("🛑 收到 GUI 完全退出指令, 守护进程退出")
@@ -241,6 +256,19 @@ class DaemonApp:
         else:
             self._restart_count += 1
 
+    def _load_state(self):
+        try:
+            import json
+            if not os.path.exists(STATE_FILE):
+                return
+            with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self._target_bottom = bool(data.get("target_bottom", False))
+            if self._target_bottom:
+                logging.info("已恢复窗口最小化置底状态")
+        except Exception as e:
+            logging.debug(f"状态文件读取失败: {e}")
+
     def _write_state(self):
         try:
             import json
@@ -249,13 +277,15 @@ class DaemonApp:
                 "daemon_pid": os.getpid(),
                 "gui_pid": self._gui_pid,
                 "restart_count": self._restart_count,
+                "target_bottom": self._target_bottom,
                 "timestamp": int(time.time()),
                 "version": VERSION,
             }
-            tmp = STATE_FILE + ".tmp"
-            with open(tmp, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, STATE_FILE)
+            with self._state_lock:
+                tmp = STATE_FILE + ".tmp"
+                with open(tmp, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                os.replace(tmp, STATE_FILE)
         except Exception as e:
             logging.error(f"状态文件写入失败: {e}")
 
@@ -280,6 +310,8 @@ class DaemonApp:
         if not self._lock.acquire(stale_owner_check=self._stale_owner_dead):
             logging.info("已有守护进程在运行, 本实例退出")
             return
+
+        self._load_state()
 
         # 关机监听
         self._start_shutdown_listener()

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-config.py - 全局配置 (v4.0 双进程版)
+config.py - 全局配置 (v4.1 双进程版)
 """
 import os
 import sys
@@ -31,7 +31,7 @@ def _base_dir():
 
 BASE_DIR = _base_dir()
 APP_NAME = "往昔的涟漪"
-VERSION = "4.0"
+VERSION = "4.1"
 
 # ---------- 日志 / 状态文件 ----------
 GUI_LOG = os.path.join(BASE_DIR, "seewo_guard_gui.log")
