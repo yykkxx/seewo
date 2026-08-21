@@ -11,7 +11,8 @@ import logging
 import socket
 import threading
 
-from seewo_guard.config import IPC_PORT_BASE
+from seewo_guard.config import IPC_PORT_BASE, IPC_MAX_CONNECTIONS, IPC_AUTH_TOKEN
+from seewo_guard.logging_system import log_suppressed_exception
 from seewo_guard.utils import get_session_id
 
 BUF_SIZE = 65536
@@ -34,6 +35,7 @@ class IpcServer:
         self._address = address or ipc_address()
         self._sock = None
         self._stop = threading.Event()
+        self._conn_sem = threading.BoundedSemaphore(max(1, IPC_MAX_CONNECTIONS))
 
     def start(self):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -61,6 +63,16 @@ class IpcServer:
                 continue
             except OSError:
                 break
+            if not self._conn_sem.acquire(blocking=False):
+                try:
+                    conn.sendall(b'{"ok":false,"error":"busy"}\n')
+                except OSError:
+                    pass
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                continue
             t = threading.Thread(target=self._serve, args=(conn,), daemon=True)
             t.start()
 
@@ -69,40 +81,50 @@ class IpcServer:
             conn.settimeout(5.0)
             with conn:
                 data = self._recv_line(conn)
-                if not data:
+                if data == b"":
+                    return
+                if data is None:
+                    conn.sendall(b'{"ok":false,"error":"request_too_large"}\n')
                     return
                 try:
                     req = json.loads(data.decode('utf-8', errors='replace'))
                 except ValueError:
                     resp = {"ok": False, "error": "bad_json"}
                 else:
-                    try:
-                        resp = self._handler(req) or {"ok": True}
-                    except Exception as e:
-                        logging.error(f"IPC handler 异常: {e}")
-                        resp = {"ok": False, "error": str(e)}
+                    if not isinstance(req, dict):
+                        resp = {"ok": False, "error": "bad_request"}
+                    elif IPC_AUTH_TOKEN and req.get("_token") != IPC_AUTH_TOKEN:
+                        resp = {"ok": False, "error": "unauthorized"}
+                    else:
+                        req.pop("_token", None)
+                        try:
+                            resp = self._handler(req) or {"ok": True}
+                        except Exception:
+                            log_suppressed_exception("IPC handler 异常")
+                            resp = {"ok": False, "error": "handler_error"}
                 payload = json.dumps(resp, ensure_ascii=False).encode('utf-8') + b"\n"
                 conn.sendall(payload)
         except Exception:
-            pass
+            log_suppressed_exception("IPC 连接处理失败")
         finally:
             try:
                 conn.close()
             except OSError:
                 pass
+            self._conn_sem.release()
 
     @staticmethod
     def _recv_line(conn):
         """按行读取 (缓冲, 直到换行)"""
         buf = b""
-        while len(buf) < BUF_SIZE:
+        while len(buf) <= BUF_SIZE:
             chunk = conn.recv(4096)
             if not chunk:
                 return b""
             buf += chunk
             if b"\n" in buf:
                 return buf.split(b"\n", 1)[0]
-        return buf
+        return None
 
 
 # ==========================================
@@ -117,10 +139,15 @@ class IpcClient:
 
     def request(self, payload) -> dict:
         """发送请求并等待响应, 失败返回 None"""
+        if not isinstance(payload, dict):
+            return None
+        req = dict(payload)
+        if IPC_AUTH_TOKEN and "_token" not in req:
+            req["_token"] = IPC_AUTH_TOKEN
         try:
             with socket.create_connection(self._address, timeout=self._timeout) as s:
                 s.settimeout(self._timeout)
-                data = json.dumps(payload, ensure_ascii=False).encode('utf-8') + b"\n"
+                data = json.dumps(req, ensure_ascii=False).encode('utf-8') + b"\n"
                 s.sendall(data)
                 buf = b""
                 while len(buf) < BUF_SIZE:

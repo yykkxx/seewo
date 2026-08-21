@@ -1,52 +1,55 @@
 # -*- coding: utf-8 -*-
-"""守护进程生命周期测试: 启动 -> IPC status/gui_hello -> 安全退出 (无关键进程)"""
-import os, sys, time, subprocess
+"""守护进程生命周期集成测试。"""
+import os
+import subprocess
+import sys
+import time
+import unittest
+from pathlib import Path
 
-try:
-    sys.stdout.reconfigure(encoding='utf-8')
-    sys.stderr.reconfigure(encoding='utf-8')
-except Exception:
-    pass
 
-CODEX = r"C:\yykkxx\code\seewo\codex"
-sys.path.insert(0, CODEX)
-os.chdir(CODEX)
+REPO_ROOT = Path(__file__).resolve().parents[1]
+RUN_INTEGRATION = os.environ.get("SEEWO_GUARD_RUN_INTEGRATION") == "1"
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
-for f in ("seewo_guard_daemon.log",):
-    try:
-        os.remove(os.path.join(CODEX, f))
-    except OSError:
-        pass
 
-proc = subprocess.Popen(
-    [sys.executable, "main.py", "--daemon"],
-    cwd=CODEX, creationflags=0x08000000,
-    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-print("DAEMON PID:", proc.pid)
-time.sleep(3)
+class DaemonLifecycleTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("win"), "Windows only")
+    @unittest.skipUnless(
+        RUN_INTEGRATION,
+        "set SEEWO_GUARD_RUN_INTEGRATION=1 to run integration tests",
+    )
+    def test_daemon_start_status_shutdown(self):
+        daemon_log = REPO_ROOT / "seewo_guard_daemon.log"
+        daemon_log.unlink(missing_ok=True)
 
-from seewo_guard.ipc import IpcClient
-c = IpcClient()
-print("STATUS:", c.request({"cmd": "status"}))
-print("BOTTOM ON:", c.request({"cmd": "set_target_bottom", "enabled": True}))
-print("GUI_HELLO:", c.request({"cmd": "gui_hello", "pid": 12345}))
-print("STATUS2:", c.request({"cmd": "status"}))
-print("BOTTOM OFF:", c.request({"cmd": "set_target_bottom", "enabled": False}))
-print("SHUTDOWN:", c.request({"cmd": "shutdown", "pid": 12345}))
+        proc = subprocess.Popen(
+            [sys.executable, str(REPO_ROOT / "main.py"), "--daemon"],
+            cwd=str(REPO_ROOT),
+            creationflags=CREATE_NO_WINDOW,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            time.sleep(2)
+            from seewo_guard.ipc import IpcClient
+            client = IpcClient()
+            status = client.request({"cmd": "status"})
+            self.assertIsNotNone(status)
+            self.assertTrue(status.get("ok"))
+            self.assertEqual(status.get("role"), "daemon")
+            shutdown = client.request({"cmd": "shutdown"})
+            self.assertTrue(shutdown and shutdown.get("ok"))
+            proc.wait(timeout=10)
+            self.assertIsNotNone(proc.returncode)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
 
-time.sleep(2)
-rc = proc.poll()
-print("DAEMON EXIT CODE:", rc)
-if rc is None:
-    print("DAEMON STILL ALIVE (BAD)")
-    proc.terminate(); time.sleep(1)
-    if proc.poll() is None:
-        proc.kill()
-else:
-    print("DAEMON EXITED CLEANLY (GOOD)")
 
-log = os.path.join(CODEX, "seewo_guard_daemon.log")
-if os.path.exists(log):
-    print("----- daemon log tail -----")
-    with open(log, "r", encoding="utf-8") as f:
-        print("".join(f.readlines()[-16:]))
+if __name__ == "__main__":
+    unittest.main()

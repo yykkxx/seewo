@@ -38,7 +38,9 @@ from seewo_guard.win_api import (
     wintypes,
 )
 from ctypes import wintypes as _wintypes
-from seewo_guard.logging_system import setup_logging, shutdown_logging
+from seewo_guard.logging_system import (
+    setup_logging, shutdown_logging, log_suppressed_exception,
+)
 from seewo_guard.protection import get_protection
 from seewo_guard.ipc import IpcServer
 from seewo_guard.utils import (
@@ -154,8 +156,26 @@ class DaemonApp:
     # ==========================================
     # IPC 请求处理
     # ==========================================
+    @staticmethod
+    def _parse_pid(req):
+        try:
+            return int(req.get("pid", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _parse_enabled(req):
+        value = req.get("enabled", False)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
     def _handle_request(self, req):
         cmd = req.get("cmd")
+        if not isinstance(cmd, str):
+            return {"ok": False, "error": "bad_cmd"}
 
         if cmd == "status":
             return {
@@ -170,7 +190,7 @@ class DaemonApp:
             }
 
         if cmd == "gui_hello":
-            pid = int(req.get("pid", 0) or 0)
+            pid = self._parse_pid(req)
             self._gui_pid = pid
             self._last_hb = time.monotonic()
             self._restart_count = 0
@@ -184,14 +204,14 @@ class DaemonApp:
             }
 
         if cmd == "gui_alive":
-            pid = int(req.get("pid", 0) or 0)
+            pid = self._parse_pid(req)
             if pid:
                 self._gui_pid = pid
                 self._last_hb = time.monotonic()
             return {"ok": True}
 
         if cmd == "set_target_bottom":
-            enabled = bool(req.get("enabled", False))
+            enabled = self._parse_enabled(req)
             if enabled != self._target_bottom:
                 self._target_bottom = enabled
                 logging.info(f"窗口置底状态: {'开启' if enabled else '关闭'}")
@@ -219,7 +239,7 @@ class DaemonApp:
                 if pid > 0 and pid != os.getpid():
                     return not pid_alive(pid)
         except Exception:
-            pass
+            log_suppressed_exception("守护进程检查过期互斥锁失败")
         return False
 
     def _watchdog_tick(self):
@@ -334,6 +354,7 @@ class DaemonApp:
                 self._watchdog_tick()
         finally:
             self._graceful_exit()
+        return 0
 
     def _graceful_exit(self):
         logging.info("🔄 守护进程退出流程...")
@@ -353,18 +374,20 @@ class DaemonApp:
         except Exception:
             pass
         logging.info("✅ 守护进程已安全退出")
-        shutdown_logging()
-        os._exit(0)
 
 
 def daemon_main():
     setup_logging(DAEMON_LOG)
+    exit_code = 0
     try:
-        DaemonApp().run()
+        app = DaemonApp()
+        exit_code = app.run() or 0
     except SystemExit:
         raise
     except Exception as e:
         import traceback
         logging.critical(f"💥 守护进程异常: {e}\n{traceback.format_exc()}")
+        exit_code = 1
+    finally:
         shutdown_logging()
-        os._exit(1)
+    raise SystemExit(exit_code)

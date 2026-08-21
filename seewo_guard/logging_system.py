@@ -70,6 +70,10 @@ class RotatingFileHandlerSafe(logging.Handler):
 _logger_initialized = False
 
 
+def log_suppressed_exception(context, level=logging.DEBUG):
+    logging.log(level, f"{context}", exc_info=True)
+
+
 def setup_logging(log_file, log_box=None, level=logging.DEBUG):
     """初始化日志: 文件 + 控制台(脚本模式) + GUI(可选)"""
     global _logger_initialized

@@ -11,6 +11,7 @@ import sys
 from ctypes import wintypes
 
 from seewo_guard.config import IS_FROZEN, TEST_MODE, resource_path, self_exe
+from seewo_guard.logging_system import log_suppressed_exception
 
 
 _PACKAGER_ENV_PREFIXES = ("_PYI_", "NUITKA_")
@@ -90,8 +91,10 @@ def prepare_gui_process():
             _request_admin()
             return True
     except Exception:
+        log_suppressed_exception("管理员权限检查失败，按非提权流程继续")
         return False
     try:
         return _start_uiaccess()
     except Exception:
+        log_suppressed_exception("UIAccess 启动失败，按普通管理员流程继续")
         return False

@@ -27,10 +27,11 @@
 ## 目录结构
 
 ```
-codex/
+seewo/
 ├── main.py                    # 入口 (默认GUI / --daemon / --gui)
 ├── build.py                   # 打包脚本 (PyInstaller / Nuitka)
 ├── requirements.txt
+├── tests/                     # 单元/集成测试 (unittest)
 └── seewo_guard/
     ├── config.py              # 全局配置 (路径/互斥锁/IPC/目标EXE)
     ├── win_api.py             # Windows API 声明 (ctypes)
@@ -47,7 +48,7 @@ codex/
 ## 运行
 
 ```powershell
-cd C:\yykkxx\code\seewo\codex
+cd C:\path\to\seewo
 pip install -r requirements.txt
 
 # 正常运行 (自动拉起守护进程)
@@ -60,6 +61,33 @@ python main.py --gui
 
 首次运行会请求管理员权限 (UAC)。两个进程都以管理员运行。
 非管理员环境可自动降级 (会话级互斥锁), 仅用于测试。
+
+## 配置解耦 (环境变量/配置文件)
+
+- 可选配置文件: `seewo_guard_config.json` (默认放在程序目录，也可用 `SEEWO_GUARD_CONFIG` 指定)
+- 支持覆盖项:
+  - `version` / `SEEWO_GUARD_VERSION`
+  - `target_exes` / `SEEWO_GUARD_TARGET_EXES` (推荐 JSON 数组或按行分隔字符串)
+  - `ipc_auth_token` / `SEEWO_GUARD_IPC_AUTH_TOKEN`
+  - `ipc_max_connections` / `SEEWO_GUARD_IPC_MAX_CONNECTIONS`
+  - `max_gui_restarts` / `SEEWO_GUARD_MAX_GUI_RESTARTS`
+  - `daemon_gui_timeout` / `SEEWO_GUARD_DAEMON_GUI_TIMEOUT`
+  - `daemon_start_grace` / `SEEWO_GUARD_DAEMON_START_GRACE`
+  - `gui_heartbeat` / `SEEWO_GUARD_GUI_HEARTBEAT`
+  - `daemon_tick` / `SEEWO_GUARD_DAEMON_TICK`
+
+示例:
+
+```json
+{
+  "version": "4.1",
+  "target_exes": [
+    "C:\\Program Files (x86)\\Seewo\\...\\screen-broadcast.exe"
+  ],
+  "ipc_auth_token": "change-me",
+  "ipc_max_connections": 32
+}
+```
 
 ## 打包
 
@@ -186,6 +214,17 @@ python -m nuitka --onefile --windows-disable-console --windows-uac-admin ^
 $env:SEEWO_GUARD_TEST = "1"          # 跳过提权/UIAccess 链
 $env:SEEWO_GUARD_AUTO_QUIT_MS = "4000"  # GUI 启动4秒后自动退出 (便于自动化测试)
 python main.py
+```
+
+## 测试
+
+```powershell
+# 单元/集成测试入口 (默认仅执行可在当前环境运行的测试)
+python -m unittest discover -s tests -p "test_*.py"
+
+# Windows 上执行集成测试 (会真实拉起 GUI/守护进程)
+$env:SEEWO_GUARD_RUN_INTEGRATION = "1"
+python -m unittest discover -s tests -p "test_*.py"
 ```
 
 ## 性能优化

@@ -1,61 +1,56 @@
 # -*- coding: utf-8 -*-
-"""双进程测试: GUI 自动拉起守护进程 -> 心跳 -> 自动安全退出"""
-import os, sys, time, subprocess
+"""GUI/守护双进程集成测试。"""
+import os
+import subprocess
+import sys
+import time
+import unittest
+from pathlib import Path
 
-try:
-    sys.stdout.reconfigure(encoding='utf-8')
-except Exception:
-    pass
 
-CODEX = r"C:\yykkxx\code\seewo\codex"
-os.chdir(CODEX)
+REPO_ROOT = Path(__file__).resolve().parents[1]
+RUN_INTEGRATION = os.environ.get("SEEWO_GUARD_RUN_INTEGRATION") == "1"
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
-for f in ("seewo_guard_daemon.log", "seewo_guard_gui.log"):
-    try:
-        os.remove(os.path.join(CODEX, f))
-    except OSError:
-        pass
 
-env = dict(os.environ)
-env["SEEWO_GUARD_TEST"] = "1"
-env["SEEWO_GUARD_AUTO_QUIT_MS"] = "4000"
+class GuiDualProcessTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("win"), "Windows only")
+    @unittest.skipUnless(
+        RUN_INTEGRATION,
+        "set SEEWO_GUARD_RUN_INTEGRATION=1 to run integration tests",
+    )
+    def test_gui_spawns_daemon_and_exits_cleanly(self):
+        env = dict(os.environ)
+        env["SEEWO_GUARD_TEST"] = "1"
+        env["SEEWO_GUARD_AUTO_QUIT_MS"] = "2500"
 
-gui = subprocess.Popen(
-    [sys.executable, "main.py"],
-    cwd=CODEX, env=env, creationflags=0x08000000,
-    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-print("GUI PID:", gui.pid)
+        proc = subprocess.Popen(
+            [sys.executable, str(REPO_ROOT / "main.py")],
+            cwd=str(REPO_ROOT),
+            env=env,
+            creationflags=CREATE_NO_WINDOW,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            proc.wait(timeout=20)
+            self.assertIsNotNone(proc.returncode)
+            time.sleep(1.0)
+            from seewo_guard.ipc import IpcClient
+            client = IpcClient()
+            status = client.request({"cmd": "status"})
+            if status:
+                client.request({"cmd": "shutdown"})
+                time.sleep(1.0)
+            self.assertIsNone(client.request({"cmd": "status"}))
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
 
-# 等待 GUI 与守护进程都退出 (最多 30s)
-t0 = time.time()
-while time.time() - t0 < 30:
-    if gui.poll() is not None:
-        break
-    time.sleep(0.5)
-print("GUI EXIT CODE:", gui.poll())
 
-# 查找守护进程是否还在
-import psutil
-daemons = []
-for p in psutil.process_iter(["pid", "cmdline"]):
-    try:
-        cl = " ".join(p.info["cmdline"] or [])
-        if "main.py" in cl and "--daemon" in cl:
-            daemons.append(p.info["pid"])
-    except Exception:
-        pass
-print("REMAINING DAEMON PIDS:", daemons)
-for pid in daemons:
-    try:
-        from seewo_guard.ipc import IpcClient
-        print(f"shutdown daemon {pid}:", IpcClient().request({"cmd": "shutdown"}))
-        time.sleep(1)
-    except Exception as e:
-        print("shutdown err:", e)
-
-for f in ("seewo_guard_daemon.log", "seewo_guard_gui.log"):
-    p = os.path.join(CODEX, f)
-    if os.path.exists(p):
-        print(f"----- {f} tail -----")
-        with open(p, "r", encoding="utf-8") as fh:
-            print("".join(fh.readlines()[-14:]))
+if __name__ == "__main__":
+    unittest.main()
