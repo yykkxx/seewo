@@ -55,7 +55,6 @@ def build_pyinstaller():
     subprocess.run(cmd, check=True)
     print(f"\n✅ 打包完成: dist\\{name}.exe")
 
-
 def build_nuitka():
     _ensure_assets()
     name = _output_name()
@@ -64,6 +63,7 @@ def build_nuitka():
         "--onefile",
         "--windows-console-mode=disable",
         "--windows-uac-admin",
+        "--assume-yes-for-downloads",          # ← 新增：自动同意下载 Dependency Walker
         f"--onefile-tempdir-spec={{CACHE_DIR}}/SeewoGuard/{VERSION}",
         "--onefile-cache-mode=cached",
         "--onefile-no-compression",
@@ -79,6 +79,7 @@ def build_nuitka():
     print(f"[Nuitka] {' '.join(cmd)}")
     subprocess.run(cmd, check=True)
     print(f"\n✅ 打包完成: dist\\{name}.exe")
+
 
 
 if __name__ == "__main__":
