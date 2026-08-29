@@ -19,8 +19,8 @@ if hasattr(sys.stdout, "reconfigure"):
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENTRY = os.path.join(HERE, "main.py")
 DIST = os.path.join(HERE, "dist")
-ICON = os.path.join(os.path.dirname(HERE), "icon.ico")   # seewo/icon.ico
-UIACCESS = os.path.join(os.path.dirname(HERE), "uiaccess.dll")
+ICON = os.path.join(HERE, "icon.ico")   # seewo/icon.ico
+UIACCESS = os.path.join(HERE, "uiaccess.dll")
 
 
 def _ensure_assets():
