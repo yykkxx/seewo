@@ -1,12 +1,5 @@
-# -*- coding: utf-8 -*-
-"""
-build.py - 一键打包脚本 (PyInstaller / Nuitka)
-用法:
-  python build.py pyinstaller
-  python build.py nuitka
-"""
 import os
-import shutil
+import shutil  # 不再用 copy2 后可删
 import subprocess
 import sys
 
@@ -19,19 +12,17 @@ if hasattr(sys.stdout, "reconfigure"):
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENTRY = os.path.join(HERE, "main.py")
 DIST = os.path.join(HERE, "dist")
-ICON = os.path.join(HERE, "icon.ico")   # seewo/icon.ico
+ICON = os.path.join(HERE, "icon.ico")      # seewo/icon.ico
 UIACCESS = os.path.join(HERE, "uiaccess.dll")
 
 
 def _ensure_assets():
-    """把 icon.ico / uiaccess.dll 复制到项目目录 (打包进产物)"""
-    for src, name in ((ICON, "icon.ico"), (UIACCESS, "uiaccess.dll")):
-        if os.path.exists(src):
-            dst = os.path.join(HERE, name)
-            shutil.copy2(src, dst)
-            print(f"[资源] {name} -> {dst}")
+    """资产已随仓库提交到根目录(HERE)，只校验存在性，不复制。"""
+    for p, tag in ((ICON, "icon.ico"), (UIACCESS, "uiaccess.dll")):
+        if os.path.exists(p):
+            print(f"[资源] {tag} -> {p}")
         else:
-            print(f"[提示] 未找到 {src}")
+            print(f"[警告] 缺少 {tag}，打包可能失败: {p}")
 
 
 def _output_name():
