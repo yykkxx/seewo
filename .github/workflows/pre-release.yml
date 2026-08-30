@@ -198,6 +198,8 @@ jobs:
         if: ${{ inputs.prune_old || github.event_name != 'workflow_dispatch' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 本 job 不 checkout 代码, gh 需要 GH_REPO 才能定位仓库
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           gh release list --limit 100 \
@@ -212,6 +214,7 @@ jobs:
       - name: 创建 prerelease Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.version.outputs.tag }}
           VERSION: ${{ needs.version.outputs.version }}
         run: |
