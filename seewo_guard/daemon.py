@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-daemon.py - 常驻进程 (v4.3 双进程架构中的无界面进程)
+daemon.py - 常驻进程 (v4.4 双进程架构中的无界面进程)
 
 核心作用: 让 GUI 在任务管理器里「结束不掉」。GUI 被结束后, 本进程在下一
           个心跳周期把它重新拉起。这是本项目唯一的抗结束手段 ——
@@ -34,9 +34,9 @@ import threading
 import time
 
 from seewo_guard.config import (
-    DAEMON_LOG, DAEMON_MUTEX, STATE_FILE,
+    DAEMON_LOG, DAEMON_MUTEX, GUI_MUTEX, STATE_FILE,
     DAEMON_GUI_TIMEOUT, DAEMON_START_GRACE, DAEMON_TICK,
-    MAX_GUI_RESTARTS, VERSION,
+    MAX_GUI_RESTARTS, GUI_RESTART_WINDOW, VERSION, APP_NAME,
 )
 from seewo_guard.win_api import (
     user32, kernel32,
@@ -47,6 +47,7 @@ from seewo_guard.win_api import (
     WM_QUERYENDSESSION, WM_ENDSESSION, WM_DESTROY,
     MSG, WNDCLASSW, WNDPROC,
     CTRL_SHUTDOWN_EVENT, CTRL_LOGOFF_EVENT, CTRL_CLOSE_EVENT,
+    CreateMutexW, CloseHandle,
     wintypes,
 )
 from ctypes import wintypes as _wintypes
@@ -54,7 +55,11 @@ from seewo_guard.logging_system import setup_logging, shutdown_logging
 from seewo_guard.protection import get_protection
 from seewo_guard.ipc import IpcServer
 from seewo_guard.utils import (
-    SingleInstanceLock, spawn_hidden, gui_cmd, get_session_id, pid_alive,
+    SingleInstanceLock, spawn_hidden, spawn_detached, gui_cmd,
+    get_session_id, pid_alive,
+)
+from seewo_guard.window_ops import (
+    resume_target_threads, launch_main_target, cleanup_firewall_rules,
 )
 
 
@@ -74,8 +79,12 @@ class DaemonApp:
         # GUI 看护状态
         self._gui_pid = 0
         self._last_hb = 0.0
-        self._restart_count = 0
+        self._last_spawn_time = 0.0   # 上次拉起 GUI 的时刻 (冷却用)
+        self._restart_times = []       # 时间窗内重拉 GUI 的时间戳列表
         self._expecting_pid = None
+        self._gui_requested_shutdown = False   # GUI 主动要求退出 (已自清理)
+        self._threads_suspended = False        # GUI 上报: 目标线程被挂起
+        self._net_blocked = False              # GUI 上报: 禁网开关
 
     # ==========================================
     # 关机监听 (隐藏窗口 + 消息循环)
@@ -101,7 +110,7 @@ class DaemonApp:
             wc.hCursor = None
             wc.hbrBackground = None
             wc.lpszMenuName = None
-            wc.lpszClassName = f"SeewoGuardDaemon_{os.getpid()}"
+            wc.lpszClassName = f"{APP_NAME}_daemon_{os.getpid()}"
 
             atom = RegisterClassW(ctypes.byref(wc))
             if not atom:
@@ -176,7 +185,7 @@ class DaemonApp:
                 "pid": os.getpid(),
                 "version": VERSION,
                 "gui_pid": self._gui_pid,
-                "restart_count": self._restart_count,
+                "restart_count": len(self._restart_times),
                 "target_bottom": self._target_bottom,
                 "uptime": round(time.monotonic() - self._start_time, 1),
             }
@@ -185,7 +194,7 @@ class DaemonApp:
             pid = int(req.get("pid", 0) or 0)
             self._gui_pid = pid
             self._last_hb = time.monotonic()
-            self._restart_count = 0
+            self._restart_times = []
             self._expecting_pid = None
             logging.info(f"👋 GUI 已连接 (PID={pid})")
             self._write_state()
@@ -202,6 +211,13 @@ class DaemonApp:
                 self._last_hb = time.monotonic()
             return {"ok": True}
 
+        if cmd == "set_flags":
+            """GUI 上报运行时开关状态, 供异常退出时恢复现场 (见 _recover_environment)"""
+            self._threads_suspended = bool(req.get("threads_suspended", False))
+            self._net_blocked = bool(req.get("net_blocked", False))
+            self._write_state()
+            return {"ok": True}
+
         if cmd == "set_target_bottom":
             enabled = bool(req.get("enabled", False))
             if enabled != self._target_bottom:
@@ -212,6 +228,7 @@ class DaemonApp:
 
         if cmd == "shutdown":
             logging.warning("🛑 收到 GUI 完全退出指令, 守护进程退出")
+            self._gui_requested_shutdown = True   # GUI 已自行恢复现场
             self._stop.set()
             return {"ok": True}
 
@@ -234,6 +251,31 @@ class DaemonApp:
             pass
         return False
 
+    def _gui_process_exists(self):
+        """探测是否有 GUI 实例存活 (即使心跳暂时丢失)。
+
+        任务管理器「结束任务」先发 WM_CLOSE 再强制结束, 期间旧 GUI 还活着、
+        仍持有互斥锁; 此时重拉的新实例会抢锁失败自退。所以在重拉前先探测
+        互斥锁, 若仍有实例则不重拉、不计入失败, 等它真正退出后下轮再处理。
+        """
+        try:
+            h = CreateMutexW(None, False, GUI_MUTEX)
+            if not h:
+                return True
+            err = ctypes.get_last_error()
+            CloseHandle(h)
+            return err == 183  # ERROR_ALREADY_EXISTS
+        except Exception:
+            return False
+
+    def _bump_restart(self):
+        """在时间窗内累计重拉次数; 窗口过期则重新开始计数。"""
+        now = time.monotonic()
+        if not self._restart_times or now - self._restart_times[0] > GUI_RESTART_WINDOW:
+            self._restart_times = []
+        self._restart_times.append(now)
+        return len(self._restart_times)
+
     def _watchdog_tick(self):
         """GUI 心跳检查: 心跳丢失立即重启 GUI (不等长宽限期)"""
         now = time.monotonic()
@@ -245,28 +287,105 @@ class DaemonApp:
             if now - self._last_hb <= DAEMON_GUI_TIMEOUT:
                 return
             # 心跳丢失 (GUI 被任务管理器结束等)
-            self._restart_count += 1
             self._gui_pid = 0
         else:
             # 守护启动后从未收到 GUI 注册: 主动拉起一次
             if self._expecting_pid and pid_alive(self._expecting_pid):
                 return  # 已拉起的 GUI 还在启动中
-            self._restart_count += 1
 
-        if self._restart_count > MAX_GUI_RESTARTS:
-            logging.critical(f"💀 GUI 连续异常 {MAX_GUI_RESTARTS} 次, "
-                             "守护进程安全退出")
+        # 拉起冷却: 刚拉起的 GUI 需要时间完成启动并抢到互斥锁, 冷却期内
+        # 不再重复拉起, 避免一次心跳丢失拉出多个实例互相抢锁
+        if now - self._last_spawn_time < 8.0:
+            return
+
+        # 重拉前探测: GUI 可能正被 taskmgr 结束任务 (还活着), 不重拉
+        if self._gui_process_exists():
+            self._last_hb = now
+            return
+
+        count = self._bump_restart()
+        if count > MAX_GUI_RESTARTS:
+            logging.critical(f"💀 GUI 在 {int(GUI_RESTART_WINDOW)}s 内连续异常 "
+                             f"{count} 次, 守护进程放弃看护并恢复现场")
             self._stop.set()
             return
 
-        logging.warning(f"⚠️ GUI 缺失 ({self._restart_count}/{MAX_GUI_RESTARTS}), "
-                        "重新拉起 GUI...")
-        proc = spawn_hidden(gui_cmd())
+        logging.warning(f"⚠️ GUI 缺失 ({count}/{MAX_GUI_RESTARTS} @ "
+                        f"{int(GUI_RESTART_WINDOW)}s 窗), 重新拉起 GUI...")
+        # 脱离式拉起: 新 GUI 挂在 explorer 下, 不是本进程的子进程,
+        # 这样对方用「结束进程树」杀本进程时不会把 GUI 一起带走
+        proc = spawn_detached(gui_cmd(), show=1)
         if proc:
-            self._expecting_pid = proc.pid
+            self._last_spawn_time = now
+            self._expecting_pid = None  # ShellExecute 拿不到 PID, 靠心跳确认
             self._last_hb = now  # 防止连续快速误判
         else:
-            self._restart_count += 1
+            self._last_hb = now + 5.0  # 启动失败, 5 秒后再试
+
+    def _recover_environment(self):
+        """异常退出后恢复现场: 恢复被挂起的希沃线程, 拉起希沃, 清理防火墙。
+
+        仅在 GUI 未主动请求退出的情况下调用 (GUI 正常退出时自己已恢复)。
+        """
+        recovered = False
+        if self._threads_suspended:
+            logging.warning("🛠️ GUI 异常退出时目标线程仍被挂起, 正在恢复...")
+            try:
+                n = resume_target_threads()
+                logging.info(f"🛠️ 已恢复 {n} 个目标线程")
+                recovered = True
+            except Exception as e:
+                logging.error(f"恢复线程失败: {e}")
+            # 希沃恢复运行后再拉起主程序窗口
+            try:
+                launch_main_target()
+            except Exception as e:
+                logging.error(f"拉起希沃失败: {e}")
+        if self._net_blocked:
+            logging.warning("🛠️ GUI 异常退出时仍处于禁网状态, 正在清理规则...")
+            try:
+                cleanup_firewall_rules()
+                recovered = True
+            except Exception as e:
+                logging.error(f"清理防火墙规则失败: {e}")
+        if recovered:
+            logging.info("✅ 异常退出现场已恢复 (线程/希沃/防火墙)")
+        # 兜底: 无论开关状态, 再清一遍可能残留的规则 (幂等)
+        try:
+            cleanup_firewall_rules()
+        except Exception:
+            pass
+
+    def _recover_stale_state(self):
+        """守护进程启动时清理上次异常退出的残留:
+        1) 上次退出时若还挂着线程 -> 恢复 (避免希沃被永久冻结)
+        2) 上次退出时若开着禁网 -> 删除残留防火墙规则
+        """
+        try:
+            import json
+            if os.path.exists(STATE_FILE):
+                with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if bool(data.get("threads_suspended", False)):
+                    logging.warning("🛠️ 检测到上次退出时线程仍挂起, 恢复中...")
+                    try:
+                        resume_target_threads()
+                        launch_main_target()
+                    except Exception as e:
+                        logging.error(f"启动恢复线程失败: {e}")
+                if bool(data.get("net_blocked", False)):
+                    logging.warning("🛠️ 检测到上次退出时仍禁网, 清理规则...")
+                    try:
+                        cleanup_firewall_rules()
+                    except Exception as e:
+                        logging.error(f"启动清理规则失败: {e}")
+        except Exception as e:
+            logging.debug(f"残留状态恢复失败: {e}")
+        # 兜底: 规则前缀固定, 无条件再清一遍 (幂等)
+        try:
+            cleanup_firewall_rules()
+        except Exception:
+            pass
 
     def _load_state(self):
         try:
@@ -276,6 +395,8 @@ class DaemonApp:
             with open(STATE_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             self._target_bottom = bool(data.get("target_bottom", False))
+            self._threads_suspended = bool(data.get("threads_suspended", False))
+            self._net_blocked = bool(data.get("net_blocked", False))
             if self._target_bottom:
                 logging.info("已恢复窗口最小化置底状态")
         except Exception as e:
@@ -288,8 +409,10 @@ class DaemonApp:
                 "role": "daemon",
                 "daemon_pid": os.getpid(),
                 "gui_pid": self._gui_pid,
-                "restart_count": self._restart_count,
+                "restart_count": len(self._restart_times),
                 "target_bottom": self._target_bottom,
+                "threads_suspended": self._threads_suspended,
+                "net_blocked": self._net_blocked,
                 "timestamp": int(time.time()),
                 "version": VERSION,
             }
@@ -313,7 +436,7 @@ class DaemonApp:
     # ==========================================
     def run(self):
         logging.info("=" * 60)
-        logging.info(f"  SeewoGuard 守护进程 v{VERSION} (双进程架构)")
+        logging.info(f"  {APP_NAME} 守护进程 v{VERSION} (双进程架构)")
         logging.info(f"  PID: {os.getpid()}  会话: {get_session_id()}")
         logging.info("=" * 60)
 
@@ -324,6 +447,8 @@ class DaemonApp:
             return
 
         self._load_state()
+        # 清理上次异常退出的残留 (残留防火墙规则 / 被挂起的线程)
+        self._recover_stale_state()
 
         # 关机监听
         self._start_shutdown_listener()
@@ -349,6 +474,9 @@ class DaemonApp:
 
     def _graceful_exit(self):
         logging.info("🔄 守护进程退出流程...")
+        # GUI 未主动请求退出 (= 异常放弃看护 / 崩溃) 时, 恢复现场
+        if not self._gui_requested_shutdown:
+            self._recover_environment()
         self._clear_state()
         try:
             if self._ipc:

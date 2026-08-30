@@ -15,7 +15,7 @@ import threading
 
 import psutil
 
-from seewo_guard.config import TARGET_EXES
+from seewo_guard.config import TARGET_EXES, FIREWALL_RULE_PREFIX
 from seewo_guard.win_api import (
     user32, kernel32,
     EnumWindows, GetWindowThreadProcessId, IsWindowVisible, IsIconic,
@@ -24,7 +24,7 @@ from seewo_guard.win_api import (
     WDA_NONE, WDA_MONITOR, WDA_EXCLUDEFROMCAPTURE,
     HAS_SETWINDOWBAND, SetWindowBand,
     SetWindowPos, ShowWindowAsync, SetForegroundWindow,
-    HWND_TOPMOST, HWND_BOTTOM,
+    HWND_TOPMOST, HWND_NOTOPMOST, HWND_BOTTOM,
     SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE,
     SWP_SHOWWINDOW, SWP_ASYNCWINDOWPOS,
     SW_MINIMIZE, SW_RESTORE, SW_MAXIMIZE,
@@ -243,35 +243,36 @@ def set_window_display_affinity_all(exe_path, affinity=WDA_MONITOR):
 
 
 def set_zbid_and_notopmost(exe_path):
-    """双重取消置顶: SetWindowBand 降级 + TOPMOST 立即取消。
+    """对指定 exe 的**全部**窗口取消置顶, 返回处理的窗口数。
 
-    两步都在同一个 exe 的**第一个**窗口句柄上执行 (hwnds[0]), 不是全部
-    窗口; 若要覆盖所有窗口需要在这里改成循环。
-
+    每个窗口都执行两步: SetWindowBand 降级 + TOPMOST 立即取消。
     「先设 TOPMOST 再设 NOTOPMOST」是有意为之: 目标窗口处于高 ZBID 时,
     直接设 NOTOPMOST 往往无效, 先顶起来再放下可以强制窗口管理器刷新
     Z 序状态。SetWindowBand 属于未公开 API, 取不到就直接跳过。
     """
     hwnds = find_all_windows_by_path(exe_path, visible=False)
     if not hwnds:
-        return
-    hwnd = hwnds[0]
-    try:
-        if HAS_SETWINDOWBAND and SetWindowBand:
-            try:
-                if SetWindowBand(hwnd, _wintypes.HWND(0), 1):
-                    logging.info(f"ZBID降级: {os.path.basename(exe_path)}")
-                    time.sleep(0.3)
-            except Exception:
-                pass
-        user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0,
-                            0x0002 | 0x0001)  # HWND_TOPMOST
-        time.sleep(0.1)
-        user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0,
-                            0x0002 | 0x0001)  # HWND_NOTOPMOST
-        logging.info(f"✅ 双重取消置顶完成: {os.path.basename(exe_path)}")
-    except Exception as e:
-        logging.error(f"取消置顶异常: {e}")
+        return 0
+    name = os.path.basename(exe_path)
+    handled = 0
+    for hwnd in hwnds:
+        try:
+            if HAS_SETWINDOWBAND and SetWindowBand:
+                try:
+                    if SetWindowBand(hwnd, _wintypes.HWND(0), 1):
+                        time.sleep(0.3)
+                except Exception:
+                    pass
+            user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0,
+                                0x0002 | 0x0001)  # HWND_TOPMOST
+            time.sleep(0.1)
+            user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0,
+                                0x0002 | 0x0001)  # HWND_NOTOPMOST
+            handled += 1
+        except Exception as e:
+            logging.debug(f"取消置顶异常 hwnd={hwnd}: {e}")
+    logging.info(f"✅ 已取消置顶 {handled}/{len(hwnds)} 个窗口: {name}")
+    return handled
 
 
 def force_kill_process(pid):
@@ -342,6 +343,23 @@ def target_thread_ids():
     return [tid for tid, pid in _snapshot_threads() if pid in target_pids]
 
 
+_DEBUG_PRIV_ENABLED = False
+
+
+def _ensure_debug_privilege():
+    """挂起/恢复前确保 SeDebugPrivilege: 没有它 OpenThread 打不开
+    高完整性(管理员)目标进程的线程句柄。幂等, 每个进程只做一次。"""
+    global _DEBUG_PRIV_ENABLED
+    if _DEBUG_PRIV_ENABLED:
+        return
+    try:
+        from seewo_guard.protection import get_protection
+        get_protection().enable()   # 其中包含 SeDebugPrivilege 的启用
+        _DEBUG_PRIV_ENABLED = True
+    except Exception:
+        pass
+
+
 def suspend_target_threads():
     """挂起目标进程的全部线程, 返回成功挂起的线程数。
 
@@ -350,7 +368,9 @@ def suspend_target_threads():
 
     注意: 挂起计数是可累加的, 同一线程被挂起 n 次就要恢复 n 次,
     因此恢复时统一走 resume_target_threads 循环减到 0。
+    需要管理员权限 + SeDebugPrivilege 才能打开对方线程句柄。
     """
+    _ensure_debug_privilege()
     count = 0
     for tid in target_thread_ids():
         handle = OpenThread(THREAD_SUSPEND_RESUME, False, tid)
@@ -370,6 +390,7 @@ def suspend_target_threads():
 
 def resume_target_threads():
     """恢复目标进程被挂起的线程, 返回已完全恢复运行的线程数。"""
+    _ensure_debug_privilege()
     count = 0
     for tid in target_thread_ids():
         handle = OpenThread(THREAD_SUSPEND_RESUME, False, tid)
@@ -396,58 +417,93 @@ def resume_target_threads():
 # 网络防火墙 (netsh)
 # ==========================================
 def _netsh(cmd, quiet=True):
-    """执行 netsh 命令。
+    """执行 netsh 命令, 返回 (是否成功, 输出文本)。
 
-    只看有没有抛异常, **不检查返回码**: netsh 失败 (例如非管理员、防火墙
-    服务被禁用) 时这里依然返回 True。因此调用方拿到的计数是「命令已下发
-    的条数」, 不等于「规则真的生效的条数」。
-
+    检查返回码: netsh 失败 (例如非管理员、防火墙服务被禁用) 时返回 False,
+    调用方据此判断命令是否真正执行成功。
     cmd.exe 用 clean_child_env() 起: 不把打包器的内部变量 (_PYI_* 等)
     带过去, 免得拉起的进程被误判成同一进程树。
     """
     try:
-        subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                       timeout=10, startupinfo=hidden_startupinfo(),
-                       creationflags=hidden_creationflags(),
-                       env=clean_child_env())
-        return True
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
+                              timeout=10, startupinfo=hidden_startupinfo(),
+                              creationflags=hidden_creationflags(),
+                              env=clean_child_env())
+        return proc.returncode == 0, (proc.stdout or "") + (proc.stderr or "")
     except Exception as e:
         if not quiet:
             logging.error(f"netsh 异常: {e}")
-        return False
+        return False, str(e)
+
+
+def _rule_name(fn):
+    return f"{FIREWALL_RULE_PREFIX}_{fn}"
+
+
+def _rule_exists(fn):
+    """用 show rule 确认规则真实存在且为出站阻止, 而不是只看 add 是否报错。"""
+    rn = _rule_name(fn)
+    ok, out = _netsh(f'netsh advfirewall firewall show rule name="{rn}" verbose')
+    return ok and "Action:" in out and "Block" in out
 
 
 def block_network():
-    """给所有目标进程加出站阻止防火墙规则, 返回已下发命令的条数。
+    """给所有目标进程加出站阻止防火墙规则, 返回**已验证生效**的规则数。
 
-    规则名为 SeewoGuard_Block_<文件名>, 卸载/恢复时按同名删除
-    (见 allow_network)。规则会持久保存在系统中, 程序异常退出也不会自动
-    清除, 需要恢复网络时点「允许网络」。
+    每条规则 add 之后再 show rule 复核: 只有确认「规则存在且 Action=Block」
+    才计数, 避免 netsh 静默失败时误报成功。
+    规则名为 <FIREWALL_RULE_PREFIX>_<文件名>, 恢复时按同名删除
+    (见 allow_network / cleanup_firewall_rules)。规则持久保存在系统中,
+    异常退出由守护进程在下次启动或放弃看护时清理。
     """
     logging.info("🚫 禁止网络...")
-    success = 0
+    verified = 0
     for p in TARGET_EXES:
         fn = os.path.basename(p)
-        rn = f"SeewoGuard_Block_{fn}"
-        cmd = (f'netsh advfirewall firewall add rule name="{rn}" '
-               f'dir=out action=block program="{p}" enable=yes')
-        if _netsh(cmd):
-            success += 1
-    logging.warning(f"✅ 已禁止 {success} 个进程的网络")
-    return success
+        rn = _rule_name(fn)
+        ok, out = _netsh(f'netsh advfirewall firewall add rule name="{rn}" '
+                         f'dir=out action=block program="{p}" enable=yes')
+        if not ok:
+            logging.warning(f"⚠️ 添加规则失败: {rn}\n{out.strip()[:200]}")
+            continue
+        if _rule_exists(fn):
+            verified += 1
+        else:
+            logging.warning(f"⚠️ 规则已添加但未生效(show rule 未确认): {rn}")
+    logging.info(f"✅ 已禁止 {verified} 个进程的网络 (均经 show rule 验证)")
+    return verified
 
 
 def allow_network():
-    """删除 block_network 添加的出站阻止规则, 返回已下发命令的条数"""
+    """删除 block_network 添加的出站阻止规则, 返回确认已删除的条数"""
     logging.info("🌐 恢复网络...")
     removed = 0
     for p in TARGET_EXES:
         fn = os.path.basename(p)
-        rn = f"SeewoGuard_Block_{fn}"
-        cmd = f'netsh advfirewall firewall delete rule name="{rn}"'
-        if _netsh(cmd):
+        rn = _rule_name(fn)
+        ok, _ = _netsh(f'netsh advfirewall firewall delete rule name="{rn}"')
+        if ok and not _rule_exists(fn):
             removed += 1
-    logging.info(f"✅ 已恢复网络 (删除 {removed} 条规则)")
+    logging.info(f"✅ 已恢复网络 (确认删除 {removed} 条规则)")
+    return removed
+
+
+def cleanup_firewall_rules():
+    """无条件清理本程序创建的全部防火墙规则 (幂等, 可重复调用)。
+
+    用于: 程序退出、守护进程启动时清理上次异常退出残留、以及守护进程
+    放弃看护 / 退出前。规则不存在时 delete 同样安全。
+    """
+    removed = 0
+    for p in TARGET_EXES:
+        fn = os.path.basename(p)
+        rn = _rule_name(fn)
+        ok, _ = _netsh(f'netsh advfirewall firewall delete rule name="{rn}"')
+        if ok and not _rule_exists(fn):
+            removed += 1
+    if removed:
+        logging.info(f"🧹 已清理 {removed} 条残留防火墙规则")
     return removed
 
 

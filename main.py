@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-main.py - SeewoGuard v4.1 入口 (双进程架构)
+main.py - seewokiller v4.4 入口 (双进程架构)
 ============================================
 用途: 关闭希沃易启学(易课堂)学生端对本机的管控。
       目标进程清单见 seewo_guard.config.TARGET_EXES。

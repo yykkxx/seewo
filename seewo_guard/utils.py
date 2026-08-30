@@ -135,13 +135,54 @@ def spawn_hidden(args):
             args,
             env=clean_child_env(),
             startupinfo=hidden_startupinfo(),
-            creationflags=hidden_creationflags(),
+            creationflags=hidden_creationflags() | 0x01000000,  # CREATE_BREAKAWAY_FROM_JOB
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
     except Exception as e:
         logging.error(f"启动子进程失败 {args}: {e}")
+        return None
+
+
+def spawn_detached(args, show=0):
+    """脱离本进程树启动目标进程 (孤儿化), 用于 GUI <-> 守护进程互拉。
+
+    原理: 通过 `cmd.exe /c start` 中间进程派生目标, cmd 启动目标后立即
+    退出, 目标进程随即被 Windows 重挂到系统级父进程, 不再属于调用方的
+    进程树 —— taskkill /T (结束进程树) 或任务管理器「结束进程树」杀掉
+    调用方时, 目标进程不会跟着死, 仍能继续把对方拉回来。
+
+    与 ShellExecute 对比: ShellExecute 在多数环境下仍把新进程挂在调用者
+    名下 (实测 parent=调用者), 无法抵抗进程树杀; cmd 中间派生则真正脱离。
+
+    提权保留: 目标进程由 cmd (本进程的子进程) 派生, 继承的是本进程的
+    令牌, 管理员/UIAccess 级别不丢失。
+
+    show: 对 GUI 传 1 (正常显示窗口), 守护进程传 0 即可。
+    """
+    try:
+        exe = args[0]
+        # 脚本模式下 python.exe 会弹控制台, 改用 pythonw.exe (无控制台)
+        if not IS_FROZEN and os.path.basename(exe).lower() in ("python.exe", "python3.exe"):
+            pythonw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+            if os.path.exists(pythonw):
+                exe = pythonw
+        inner = subprocess.list2cmdline([exe, *args[1:]])
+        # cmd 立即退出, 目标进程成为孤儿; /b 不弹新窗口
+        start_cmd = f'cmd.exe /c start "" /b {inner}'
+        proc = subprocess.Popen(
+            start_cmd,
+            env=clean_child_env(),
+            startupinfo=hidden_startupinfo(),
+            creationflags=hidden_creationflags() | 0x01000000,  # CREATE_BREAKAWAY_FROM_JOB
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True if proc else None
+    except Exception as e:
+        logging.error(f"脱离式启动失败 {args}: {e}")
         return None
 
 

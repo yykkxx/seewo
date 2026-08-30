@@ -59,6 +59,7 @@ from seewo_guard.ipc import IpcClient
 from seewo_guard.window_ops import (
     find_all_windows_by_path, set_window_display_affinity_all,
     set_zbid_and_notopmost, kill_pass, block_network, allow_network,
+    cleanup_firewall_rules,
     launch_main_target, compact_target_windows, maximize_target_windows,
     minimize_target_windows_to_bottom,
     suspend_target_threads, resume_target_threads, force_kill_process,
@@ -66,7 +67,8 @@ from seewo_guard.window_ops import (
 )
 from seewo_guard.utils import (
     get_session_id, hide_console, SingleInstanceLock, spawn_hidden,
-    daemon_cmd, activate_window_of_pid, pid_alive,
+    spawn_detached, daemon_cmd, activate_window_of_pid, pid_alive,
+    is_admin,
 )
 
 
@@ -427,7 +429,7 @@ class GuardWindow(QWidget):
                     logging.info("⏳ 守护进程尚未就绪, 等待其完成启动...")
                 else:
                     logging.warning("🔄 常驻进程离线, 尝试重新拉起...")
-                    spawn_hidden(daemon_cmd())
+                    spawn_detached(daemon_cmd(), show=0)
             return
 
         if self._daemon_down:
@@ -454,7 +456,7 @@ class GuardWindow(QWidget):
             self.lbl_daemon_status.setText("离线, 重启中...")
             self.lbl_daemon_status.setStyleSheet("color:red;font-weight:bold;")
             if self._tray:
-                self._tray.showMessage("SeewoGuard", "常驻进程离线, 正在重启...",
+                self._tray.showMessage(APP_NAME, "常驻进程离线, 正在重启...",
                                        QSystemTrayIcon.Warning, 3000)
 
     def _update_daemon_status(self, status):
@@ -615,8 +617,26 @@ class GuardWindow(QWidget):
         else:
             self._suspend_threads()
 
+    def _report_flags(self):
+        """把运行时开关状态上报给守护进程 (异常退出时由其恢复现场)"""
+        try:
+            self._client.request({
+                "cmd": "set_flags",
+                "threads_suspended": self._threads_suspended,
+                "net_blocked": self._net_blocked,
+            })
+        except Exception:
+            pass
+
     def _suspend_threads(self):
         """挂起希沃全部线程: 进程还在但不执行, 比持续杀进程省资源。"""
+        if not is_admin():
+            logging.error("❌ 挂起线程需要管理员权限, 请以管理员身份运行")
+            if self._tray:
+                self._tray.showMessage(
+                    APP_NAME, "挂起线程需要管理员权限",
+                    QSystemTrayIcon.Warning, 3000)
+            return
         logging.info("⏸️ 正在挂起目标线程...")
         n = suspend_target_threads()
         if n == 0:
@@ -626,6 +646,7 @@ class GuardWindow(QWidget):
         self._threads_suspended = True
         self.btn_suspend.setText("▶️ 恢复线程")
         self.btn_suspend.setStyleSheet("color:darkred;font-weight:bold;")
+        self._report_flags()
         logging.info(f"✅ 已挂起 {n} 个线程 (希沃已冻结)")
 
     def _resume_threads(self):
@@ -634,6 +655,7 @@ class GuardWindow(QWidget):
         self._threads_suspended = False
         self.btn_suspend.setText("⏸️ 挂起线程")
         self.btn_suspend.setStyleSheet("")
+        self._report_flags()
         logging.info(f"✅ 已恢复 {n} 个线程")
 
     def on_block_record_toggle(self):
@@ -715,11 +737,13 @@ class GuardWindow(QWidget):
                 self._net_blocked = True
                 self.btn_net.setText("🌐 允许网络")
                 self.btn_net.setStyleSheet("color:darkred;font-weight:bold;")
+                self._report_flags()
         else:
             allow_network()
             self._net_blocked = False
             self.btn_net.setText("🚫 禁止网络")
             self.btn_net.setStyleSheet("")
+            self._report_flags()
 
     # ==========================================
     # 虚拟桌面
@@ -774,7 +798,13 @@ class GuardWindow(QWidget):
         self._request_quit()
 
     def _request_quit(self):
-        """安全退出: 通知常驻进程关闭并等它先退出, 再结束本进程"""
+        """安全退出: 恢复现场, 通知常驻进程关闭并等它先退出, 再结束本进程"""
+        # 调试辅助: 记录退出触发来源, 便于排查非预期的自动退出
+        try:
+            import traceback
+            logging.debug("退出调用栈:\n" + "".join(traceback.format_stack()[-6:]))
+        except Exception:
+            pass
         logging.info("👋 请求完全退出...")
         self._quitting = True  # 完全退出中: closeEvent 不再拦截
         self._kill_stop.set()
@@ -786,9 +816,21 @@ class GuardWindow(QWidget):
         if self._target_minimized:
             self._set_target_bottom_mode(False, maximize=True)
 
+        # 恢复现场: 若线程被挂起先恢复, 再拉起希沃, 最后清防火墙规则
         if self._threads_suspended:
-            logging.warning("⚠️ 目标线程仍处于挂起状态, 退出后希沃将保持冻结; "
-                            "需要恢复请重新运行本程序并点「▶️ 恢复线程」")
+            logging.info("🛠️ 退出前恢复被挂起的希沃线程...")
+            self._resume_threads()
+            self._threads_suspended = False
+        try:
+            launch_main_target()
+        except Exception as e:
+            logging.error(f"退出时拉起希沃失败: {e}")
+        try:
+            # 无论当前开关状态, 退出时无条件清理可能残留的防火墙规则 (幂等)
+            cleanup_firewall_rules()
+        except Exception as e:
+            logging.error(f"退出时清理防火墙规则失败: {e}")
+        self._net_blocked = False
 
         # 通知常驻进程退出
         resp = self._client.request({"cmd": "shutdown", "pid": os.getpid()})
@@ -836,7 +878,7 @@ class GuardWindow(QWidget):
         self.hide()
         self.top_timer.stop()  # 防止置顶定时器把窗口重新显示
         if self._tray:
-            self._tray.showMessage("SeewoGuard", "程序仍在守护中, 双击托盘图标显示窗口",
+            self._tray.showMessage(APP_NAME, "程序仍在守护中, 双击托盘图标显示窗口",
                                    QSystemTrayIcon.Information, 2000)
 
     def _show_window(self):
@@ -858,13 +900,39 @@ def gui_main(started_at=None):
     _t0 = started_at if started_at is not None else time.monotonic()
 
     logging.info("=" * 60)
-    logging.info(f"  SeewoGuard GUI 进程 v{VERSION}")
+    logging.info(f"  {APP_NAME} GUI 进程 v{VERSION}")
     logging.info(f"  PID: {os.getpid()}  会话: {get_session_id()}")
     logging.info("=" * 60)
 
     # ---------- 单实例 ----------
+    def _gui_stale_owner_dead():
+        """旧 GUI 已被杀死且不再持有互斥锁时, 允许新实例接管。
+
+        场景: 守护进程重拉的 GUI 恰逢旧实例正被 taskmgr 结束、互斥锁尚未
+        释放; 此时若状态文件里记录的旧 gui_pid 已死, 就接管继续跑,
+        而不是退出后让守护进程反复重拉、耗尽看护预算。
+        """
+        try:
+            import json
+            if os.path.exists(STATE_FILE):
+                with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                    pid = int(json.load(f).get("gui_pid", 0) or 0)
+                if pid > 0 and pid != os.getpid():
+                    return not pid_alive(pid)
+        except Exception:
+            pass
+        return False
+
     lock = SingleInstanceLock(GUI_MUTEX)
-    if not lock.acquire():
+    # 带重试地抢锁: 旧实例正被 taskmgr 结束任务时互斥锁可能还占着,
+    # 但状态文件里的旧 gui_pid 已死 (stale) -> 允许接管;
+    # 重试窗口内若新实例已登记状态则放弃, 避免两个 GUI 并存
+    _lock_deadline = time.monotonic() + 4.0
+    while time.monotonic() < _lock_deadline:
+        if lock.acquire(stale_owner_check=_gui_stale_owner_dead):
+            break
+        time.sleep(0.4)
+    else:
         logging.info("检测到已有界面进程, 激活其窗口")
         try:
             import json
@@ -885,7 +953,8 @@ def gui_main(started_at=None):
             if client.request({"cmd": "status"}):
                 return
             logging.info("🚀 守护进程未运行, 正在拉起...")
-            spawn_hidden(daemon_cmd())
+            # 脱离式拉起: 守护进程挂在 explorer 下, 结束本进程树不会带走它
+            spawn_detached(daemon_cmd(), show=0)
             # 后台等待就绪 (最多 3 秒), 未就绪由心跳轮询兜底
             for _ in range(6):
                 time.sleep(0.5)
