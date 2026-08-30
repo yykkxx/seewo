@@ -313,13 +313,13 @@ python build.py --clean              # 彻底清理 build/ 与 dist/ 后重建
 | 每周日定时     | cron `0 3 * * 0`（**UTC 03:00**，即北京时间周日 11:00） |
 | 手动        | Actions → `Pre-Release` → `Run workflow`      |
 
-流程：生成 `日期 + SHA` 版本号 → 三平台并行构建 → 上传产物 → 创建标记为 **prerelease** 的 Release。创建前会自动删除历史预发布（手动触发时可用 `prune_old` 关闭）。
+流程：生成 `日期 + SHA` 版本号 → **Windows 上并行构建两个 exe**（PyInstaller 版 + Nuitka 版）→ exe 直接作为资产上传 → 创建标记为 **prerelease** 的 Release。创建前会自动删除历史预发布（手动触发时可用 `prune_old` 关闭）。
 
 ### 正式发布 [`release.yml`](.github/workflows/release.yml)
 
-**仅支持手动触发**。Actions → `Release` → `Run workflow`，填写 `version`（SemVer，如 `1.2.0`）、`tool`、`mode` 后运行。
+**仅支持手动触发**。Actions → `Release` → `Run workflow`，填写 `version`（SemVer，如 `1.2.0`）后运行。
 
-流程：校验版本号（去 `v` 前缀 → 校验 SemVer → 确认标签与 Release 均未被占用，**失败立即中止**）→ 三平台并行构建 → 创建标记为 **latest** 的 Release。
+流程：校验版本号（去 `v` 前缀 → 校验 SemVer → 确认标签与 Release 均未被占用，**失败立即中止**）→ Windows 上并行构建两个 exe → exe 直接作为资产上传 → 创建标记为 **latest** 的 Release。
 
 ### 共同配置
 
@@ -327,11 +327,12 @@ python build.py --clean              # 彻底清理 build/ 与 dist/ 后重建
 - `concurrency` 并发策略：预发布 `cancel-in-progress: true`；正式发布设为 `false`，避免发布被打断
 - `actions/setup-python` 的 **pip 缓存**，缓存键为 `requirements.txt`
 
-| 平台             | Runner           | 产物                              |
-| -------------- | ---------------- | ------------------------------- |
-| Linux x86_64   | `ubuntu-latest`  | `SeewoGuard-linux-x86_64.zip`   |
-| Windows x86_64 | `windows-latest` | `SeewoGuard-windows-x86_64.zip` |
-| macOS arm64    | `macos-latest`   | `SeewoGuard-macos-arm64.zip`    |
+| 打包工具        | Runner           | 产物（直接作为 Release 资产，不打压缩包） |
+| ----------- | ---------------- | ------------------------------- |
+| PyInstaller | `windows-latest` | `seewokiller_pyinstaller.exe`   |
+| Nuitka      | `windows-latest` | `seewokiller_nuitka.exe`        |
+
+两个 exe 功能相同，任选其一；下载后无需解压，直接以管理员身份运行。
 
 ---
 
@@ -384,7 +385,7 @@ python build.py --clean              # 彻底清理 build/ 与 dist/ 后重建
 6. **挂起需要管理员权限** —— `OpenThread` 对高完整性进程要求 `SeDebugPrivilege`，未提权时挂起计数为 0，按钮不会切换状态。
 7. **PPL 基本不可用** —— 需要微软签名，实际总是失败；这不是 bug。
 8. **UIAccess 需要受信任目录** —— 可执行文件需放在 `Program Files` 等位置才能拿到 UIAccess，否则「最小化置底」可能压不住希沃的置顶。
-9. **Windows-only** —— 功能依赖 Win32 API，Linux / macOS 只是能构建成功（打包工具只做静态分析），产物无法运行。
+9. **Windows-only** —— 功能依赖 Win32 API，CI 只在 `windows-latest` 上构建。
 10. **`GUI_HEARTBEAT` 未被使用** —— `config.py` 里定义了该常量，但真实心跳间隔由 `gui_app` 中的 `ipc_timer.start(2000)` 写死，改这个常量没有效果。
 11. **命名痕迹不统一** —— 界面显示名为 `往昔的涟漪`，但互斥锁（`SeewoGuard_GUI_v4`）、IPC、日志文件名、防火墙规则名都含 `SeewoGuard` 字样。
 12. **强杀路径仍可能残留** —— 若常驻进程被第三方安全软件保护而无法结束，v4.2 会打印 `❌ 常驻进程 ... 强制结束后依然存在`，此时打包版仍可能提示临时目录无法删除，需手动结束该 PID。

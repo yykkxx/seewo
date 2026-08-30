@@ -4,7 +4,8 @@ name: Release
 #  正式发布工作流
 #  - 仅支持手动触发 (workflow_dispatch)
 #  - 输入版本号后执行与预发布相同的打包流程
-#  - 产出: Ubuntu / Windows / macOS 三端构建产物 + 一个 latest 正式 Release
+#  - 产出: Windows 平台两个 exe (PyInstaller 版 + Nuitka 版)
+#          直接作为 Release 资产上传, 创建 latest 正式 Release
 # ==========================================================================
 
 on:
@@ -14,22 +15,6 @@ on:
         description: '版本号 (SemVer, 例如 1.2.0; 可带 v 前缀)'
         required: true
         type: string
-      tool:
-        description: '打包工具'
-        required: true
-        default: 'pyinstaller'
-        type: choice
-        options:
-          - pyinstaller
-          - nuitka
-      mode:
-        description: '打包模式'
-        required: true
-        default: 'onefile'
-        type: choice
-        options:
-          - onefile
-          - onedir
       notes:
         description: '发布说明 (留空则自动生成)'
         required: false
@@ -48,8 +33,6 @@ concurrency:
 
 env:
   PYTHON_VERSION: '3.11'
-  TOOL: ${{ inputs.tool }}
-  MODE: ${{ inputs.mode }}
 
 jobs:
   # ---------------------------------------------------------- 版本号校验
@@ -105,22 +88,13 @@ jobs:
 
   # ---------------------------------------------------------------- 构建
   build:
-    name: 构建 (${{ matrix.name }})
+    name: 构建 (${{ matrix.tool }})
     needs: verify
-    runs-on: ${{ matrix.os }}
+    runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            name: Linux x86_64
-            artifact: SeewoGuard-linux-x86_64
-          - os: windows-latest
-            name: Windows x86_64
-            artifact: SeewoGuard-windows-x86_64
-          - os: macos-latest
-            name: macOS arm64
-            artifact: SeewoGuard-macos-arm64
+        tool: [pyinstaller, nuitka]
 
     steps:
       - name: 检出代码
@@ -137,32 +111,19 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
-          python -m pip install pyinstaller nuitka
+          python -m pip install "pyinstaller" "nuitka" "zstandard"
 
-      - name: 打包 (${{ env.TOOL }} / ${{ env.MODE }})
+      - name: 打包 (${{ matrix.tool }}, 单文件)
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${MODE}" = "onedir" ]; then
-            python build.py --tool "${TOOL}" --onedir
-          else
-            python build.py --tool "${TOOL}" --onefile
-          fi
-
-      - name: 压缩产物
-        shell: bash
-        env:
-          ARTIFACT_NAME: ${{ matrix.artifact }}
-        run: |
-          set -euo pipefail
-          python -c "import os, shutil; os.makedirs('release', exist_ok=True); shutil.make_archive(os.path.join('release', os.environ['ARTIFACT_NAME']), 'zip', 'dist')"
-          ls -lh release/
+          python build.py --tool "${{ matrix.tool }}" --onefile
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: release/*.zip
+          name: exe-${{ matrix.tool }}
+          path: dist/*.exe
           if-no-files-found: error
           retention-days: 90
 
@@ -184,6 +145,7 @@ jobs:
           INPUT_NOTES: ${{ inputs.notes }}
         run: |
           set -euo pipefail
+          ls -lh artifacts/*/
           if [ -n "${INPUT_NOTES}" ]; then
             printf '%s\n' "${INPUT_NOTES}" > notes.md
           else
@@ -195,21 +157,18 @@ jobs:
               echo "| 版本号 | \`${VERSION}\` |"
               echo "| 提交 | \`${GITHUB_SHA}\` |"
               echo "| 分支 | \`${GITHUB_REF_NAME}\` |"
-              echo "| 打包工具 | \`${TOOL}\` |"
-              echo "| 打包模式 | \`${MODE}\` |"
               echo "| 发布时间 | $(date -u +'%Y-%m-%d %H:%M:%S') UTC |"
               echo
               echo "### 产物说明"
               echo
-              echo "- \`SeewoGuard-windows-x86_64.zip\` - Windows 平台 (功能完整)"
-              echo "- \`SeewoGuard-linux-x86_64.zip\` - Linux 平台"
-              echo "- \`SeewoGuard-macos-arm64.zip\` - macOS 平台 (Apple Silicon)"
+              echo "- \`seewokiller_pyinstaller.exe\` - PyInstaller 打包版"
+              echo "- \`seewokiller_nuitka.exe\` - Nuitka 编译打包版"
               echo
               echo "### 使用提示"
               echo
-              echo "1. Windows 用户请解压后右键以管理员身份运行 \`seewokiller_pyinstaller.exe\`。"
-              echo "2. 请确保 \`seewokiller_pyinstaller.exe\`、\`icon.ico\`、\`uiaccess.dll\` 位于同一目录。"
-              echo "3. 本项目功能依赖 Windows API, Linux / macOS 产物仅用于验证构建链路。"
+              echo "1. 两个 exe 功能相同, 任选其一; 无需解压, 下载后直接运行。"
+              echo "2. 请右键以管理员身份运行。"
+              echo "3. 本项目仅支持 Windows。"
             } > notes.md
           fi
           cat notes.md
@@ -223,10 +182,11 @@ jobs:
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
           set -euo pipefail
+          # exe 直接作为发布资产, 不打压缩包
           gh release create "$TAG" \
             --title "SeewoGuard $VERSION" \
             --notes-file notes.md \
             --latest \
             --target "$GITHUB_SHA" \
-            artifacts/*/*.zip
+            artifacts/*/*.exe
           echo "已发布正式版本: $TAG"

@@ -5,7 +5,8 @@ name: Pre-Release
 #  - push 到主分支时自动触发
 #  - 每周日定时触发 (cron, UTC 时间)
 #  - 也可手动触发 (workflow_dispatch)
-#  产出: Ubuntu / Windows / macOS 三端构建产物 + 一个标记为 prerelease 的 Release
+#  产出: Windows 平台两个 exe (PyInstaller 版 + Nuitka 版)
+#        直接作为 Release 资产上传, 标记为 prerelease
 # ==========================================================================
 
 on:
@@ -19,22 +20,6 @@ on:
     - cron: '0 3 * * 0'
   workflow_dispatch:
     inputs:
-      tool:
-        description: '打包工具'
-        required: false
-        default: 'pyinstaller'
-        type: choice
-        options:
-          - pyinstaller
-          - nuitka
-      mode:
-        description: '打包模式'
-        required: false
-        default: 'onefile'
-        type: choice
-        options:
-          - onefile
-          - onedir
       prune_old:
         description: '创建前删除历史预发布版本'
         required: false
@@ -52,8 +37,6 @@ concurrency:
 
 env:
   PYTHON_VERSION: '3.11'
-  TOOL: ${{ inputs.tool || 'pyinstaller' }}
-  MODE: ${{ inputs.mode || 'onefile' }}
 
 jobs:
   # ---------------------------------------------------------------- 版本号
@@ -91,22 +74,13 @@ jobs:
 
   # ---------------------------------------------------------------- 构建
   build:
-    name: 构建 (${{ matrix.name }})
+    name: 构建 (${{ matrix.tool }})
     needs: version
-    runs-on: ${{ matrix.os }}
+    runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            name: Linux x86_64
-            artifact: SeewoGuard-linux-x86_64
-          - os: windows-latest
-            name: Windows x86_64
-            artifact: SeewoGuard-windows-x86_64
-          - os: macos-latest
-            name: macOS arm64
-            artifact: SeewoGuard-macos-arm64
+        tool: [pyinstaller, nuitka]
 
     steps:
       - name: 检出代码
@@ -123,32 +97,19 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
-          python -m pip install pyinstaller nuitka
+          python -m pip install "pyinstaller" "nuitka" "zstandard"
 
-      - name: 打包 (${{ env.TOOL }} / ${{ env.MODE }})
+      - name: 打包 (${{ matrix.tool }}, 单文件)
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${MODE}" = "onedir" ]; then
-            python build.py --tool "${TOOL}" --onedir
-          else
-            python build.py --tool "${TOOL}" --onefile
-          fi
-
-      - name: 压缩产物
-        shell: bash
-        env:
-          ARTIFACT_NAME: ${{ matrix.artifact }}
-        run: |
-          set -euo pipefail
-          python -c "import os, shutil; os.makedirs('release', exist_ok=True); shutil.make_archive(os.path.join('release', os.environ['ARTIFACT_NAME']), 'zip', 'dist')"
-          ls -lh release/
+          python build.py --tool "${{ matrix.tool }}" --onefile
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: release/*.zip
+          name: exe-${{ matrix.tool }}
+          path: dist/*.exe
           if-no-files-found: error
           retention-days: 30
 
@@ -167,6 +128,7 @@ jobs:
         id: notes
         run: |
           set -euo pipefail
+          ls -lh artifacts/*/
           {
             echo "## 预发布 ${TAG}"
             echo
@@ -177,18 +139,15 @@ jobs:
             echo "| 版本号 | \`${TAG}\` |"
             echo "| 提交 | \`${GITHUB_SHA}\` |"
             echo "| 分支 | \`${GITHUB_REF_NAME}\` |"
-            echo "| 打包工具 | \`${TOOL}\` |"
-            echo "| 打包模式 | \`${MODE}\` |"
             echo "| 构建时间 | $(date -u +'%Y-%m-%d %H:%M:%S') UTC |"
             echo
             echo "### 产物说明"
             echo
-            echo "- \`SeewoGuard-windows-x86_64.zip\` - Windows 平台"
-            echo "- \`SeewoGuard-linux-x86_64.zip\` - Linux 平台"
-            echo "- \`SeewoGuard-macos-arm64.zip\` - macOS 平台 (Apple Silicon)"
+            echo "- \`seewokiller_pyinstaller.exe\` - PyInstaller 打包版"
+            echo "- \`seewokiller_nuitka.exe\` - Nuitka 编译打包版"
             echo
-            echo "> 本项目功能依赖 Windows API, Linux / macOS 产物仅用于验证"
-            echo "> 构建链路可用性, 无法实际运行。"
+            echo "两个 exe 功能相同, 任选其一即可; 无需解压, 下载后直接运行。"
+            echo "本项目仅支持 Windows。"
           } > notes.md
           cat notes.md
         env:
@@ -219,11 +178,11 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          # 打包产物直接放在 artifacts/ 的一级子目录中
+          # exe 直接作为发布资产, 不打压缩包
           gh release create "$TAG" \
             --title "Pre-release $VERSION" \
             --notes-file notes.md \
             --prerelease \
             --target "$GITHUB_SHA" \
-            artifacts/*/*.zip
+            artifacts/*/*.exe
           echo "已创建预发布: $TAG"
