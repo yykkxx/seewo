@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-config.py - 全局配置 (v4.1 双进程版)
+config.py - 全局配置 (v4.3 双进程版)
 """
 import os
 import sys
+import tempfile
 
 IS_COMPILED = "__compiled__" in globals()          # Nuitka 编译产物
 IS_FROZEN = getattr(sys, 'frozen', False) or IS_COMPILED
@@ -30,33 +31,78 @@ def _base_dir():
 
 
 BASE_DIR = _base_dir()
+
+
+def _data_dir():
+    """可写的数据目录: %LOCALAPPDATA%\\SeewoGuard, 拿不到时回退到系统临时目录。
+
+    不能放在 exe 所在目录: UIAccess 要求 exe 位于 Program Files 等受信任
+    目录, 而那些目录对标准用户通常不可写, 日志与状态文件会写入失败。
+    """
+    base = os.environ.get("LOCALAPPDATA") or ""
+    candidates = [os.path.join(base, "SeewoGuard")] if base else []
+    candidates.append(os.path.join(tempfile.gettempdir(), "SeewoGuard"))
+    for path in candidates:
+        try:
+            os.makedirs(path, exist_ok=True)
+            return path
+        except OSError:
+            continue
+    return tempfile.gettempdir()
+
+
+DATA_DIR = _data_dir()
+
+# 对外显示名称: 用于窗口标题、托盘提示与日志抬头。
+# 注意: GUI 启动后窗口标题很快会被随机字符串替换
+# (间隔见 TITLE_RANDOMIZE_SECONDS), 这里的取值只在最初几秒可见。
 APP_NAME = "往昔的涟漪"
-VERSION = "4.1"
+VERSION = "4.3"
 
 # ---------- 日志 / 状态文件 ----------
-GUI_LOG = os.path.join(BASE_DIR, "seewo_guard_gui.log")
-DAEMON_LOG = os.path.join(BASE_DIR, "seewo_guard_daemon.log")
-STATE_FILE = os.path.join(BASE_DIR, ".seewo_guard_state.json")
+# 统一放在 DATA_DIR (%LOCALAPPDATA%\SeewoGuard), 不写在程序目录:
+#   1) UIAccess 要求 exe 在受信任目录, 那些目录往往不可写;
+#   2) 避免把运行痕迹留在分发目录里。
+GUI_LOG = os.path.join(DATA_DIR, "seewo_guard_gui.log")
+DAEMON_LOG = os.path.join(DATA_DIR, "seewo_guard_daemon.log")
+STATE_FILE = os.path.join(DATA_DIR, ".seewo_guard_state.json")
+
+# ---------- 界面 ----------
+# 窗口标题随机化间隔 (秒)。值越小越难被按标题枚举, 但会略微增加
+# 标题栏闪烁; 0 或负数表示关闭随机化。
+TITLE_RANDOMIZE_SECONDS = 2.0
+# 维持自身窗口置顶的定时器间隔 (毫秒)。希沃大约每秒重新置顶一次,
+# 这里取 500ms 才能稳定压住; 同时也是标题随机化的时间粒度。
+TOP_KEEP_INTERVAL_MS = 500
 
 # ---------- 互斥锁 / IPC ----------
 GUI_MUTEX = "Global\\SeewoGuard_GUI_v4"
 DAEMON_MUTEX = "Global\\SeewoGuard_Daemon_v4"
 IPC_PORT_BASE = 49000   # IPC 端口基数 (实际端口 = 基数 + 会话ID%1000, 仅回环)
 
-# ---------- 目标进程 ----------
+# ---------- 目标进程: 希沃易启学(易课堂)学生端 ----------
+# 顺序有意义: 最后一项 seewo-ecr-student.exe 被视为主程序,
+# "拉起希沃" 只会启动它 (见 window_ops.launch_main_target)。
+# 若本机安装路径或版本号不同, 需要同步修改这里的四个路径。
 TARGET_EXES = [
+    # 屏幕广播: 接收教师端广播并全屏置顶显示
     r"C:\Program Files (x86)\Seewo\SeewoYiQiXueStudent\SeewoYiQiXueStudent_1.3.15.4527\resources\cppService\screen-broadcast.exe",
+    # 课堂保护: 看护其它希沃进程
     r"C:\Program Files (x86)\Seewo\SeewoYiQiXueStudent\SeewoYiQiXueStudent_1.3.15.4527\resources\cppService\classroom-protect.exe",
+    # 电子教室
     r"C:\Program Files (x86)\Seewo\SeewoYiQiXueStudent\SeewoYiQiXueStudent_1.3.15.4527\resources\cppService\electronic-classroom.exe",
+    # 学生端主程序
     r"C:\Program Files (x86)\Seewo\SeewoYiQiXueStudent\SeewoYiQiXueStudent_1.3.15.4527\seewo-ecr-student.exe",
 ]
 
-# ---------- 守护参数 ----------
-MAX_GUI_RESTARTS = 5          # GUI 连续崩溃最大重启次数
-DAEMON_GUI_TIMEOUT = 4.0      # GUI 心跳超时阈值 (秒)
-DAEMON_START_GRACE = 6.0      # 守护进程启动宽限期 (秒): 等待 GUI 注册
-GUI_HEARTBEAT = 2.0           # GUI 心跳间隔 (秒)
-DAEMON_TICK = 0.5             # 守护主循环间隔 (秒)
+# ---------- 守护进程参数 ----------
+MAX_GUI_RESTARTS = 5          # GUI 心跳连续丢失后, 最多重新拉起 GUI 的次数;
+                              # 超过则守护进程自行退出 (避免无限重启)
+DAEMON_GUI_TIMEOUT = 4.0      # GUI 心跳超时阈值 (秒); 超过即判定 GUI 已被结束
+DAEMON_START_GRACE = 6.0      # 守护进程启动宽限期 (秒): 等待 GUI 首次注册
+GUI_HEARTBEAT = 2.0           # 参考值: 与实际心跳间隔保持一致, 但代码中并未读取;
+                              # GUI 的真实间隔由 gui_app 里 ipc_timer.start(2000) 写死
+DAEMON_TICK = 0.5             # 守护进程主循环间隔 (秒)
 
 
 def resource_path(name):

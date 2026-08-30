@@ -3,10 +3,21 @@
 gui_app.py - GUI 界面进程 (v4.1)
 
 职责:
-  - 窗口 / 托盘 / 热键 / 功能按钮 (杀进程/取消置顶/防录屏/禁网/虚拟桌面)
-  - 通过本地回环 TCP 与守护进程通信: 心跳 / 状态轮询 / 完全退出
-  - 被任务管理器结束不影响守护进程; 守护进程会自动重新拉起本进程
-  - 关闭窗口 = 收缩到托盘, 只有「完全退出」才真正退出
+  - 操作界面与系统托盘, 提供功能按钮:
+      杀进程(单次 / 持续) | 拉起希沃 | 取消置顶 | 修改大小 | 最小化置底 |
+      防录屏 | 禁止网络 | 虚拟桌面(移入现有桌面, 或新建桌面后移入)
+  - 全局热键 Ctrl+Alt+Y / K / Q; 优先用 WH_KEYBOARD_LL 钩子,
+    注册失败时回退 RegisterHotKey
+  - 通过本地回环 TCP 与守护进程通信: 心跳、状态轮询、
+    同步「最小化置底」开关、通知守护进程退出
+  - 被任务管理器结束不影响守护进程; 守护进程会重新拉起本进程
+  - 关闭窗口 = 收缩到托盘, 只有「完全退出」或 Ctrl+Alt+Q 才真正退出
+
+启动后自动执行的动作:
+  - 1.2 秒后自动开启防录屏
+  - 每秒维持自身窗口置顶, 并每 10 秒把窗口标题换成随机字符串
+  - 自身窗口设置 WDA_EXCLUDEFROMCAPTURE, 不出现在截图 / 录屏结果中
+  - 虚拟桌面 COM 探测与进程加固放到首帧之后, 避免拖慢界面出现
 """
 import ctypes
 import os
@@ -27,6 +38,7 @@ from PySide6.QtGui import QIcon, QAction, QTextCursor
 from seewo_guard.config import (
     APP_NAME, GUI_LOG, GUI_MUTEX, TARGET_EXES,
     STATE_FILE, TEST_AUTO_QUIT_MS, resource_path,
+    VERSION, DATA_DIR, TITLE_RANDOMIZE_SECONDS, TOP_KEEP_INTERVAL_MS,
 )
 from seewo_guard.win_api import (
     user32, SetWindowPos, HWND_TOPMOST,
@@ -49,6 +61,7 @@ from seewo_guard.window_ops import (
     set_zbid_and_notopmost, kill_pass, block_network, allow_network,
     launch_main_target, compact_target_windows, maximize_target_windows,
     minimize_target_windows_to_bottom,
+    suspend_target_threads, resume_target_threads, force_kill_process,
     VirtualDesktopManager,
 )
 from seewo_guard.utils import (
@@ -67,6 +80,7 @@ class GuardWindow(QWidget):
         self._lock = lock
         self._daemon_down = False
         self._last_spawn_try = 0.0
+        self._boot_monotonic = time.monotonic()  # 用于守护进程启动宽限期判断
         self._net_blocked = False
         self._record_blocked = False
         self._killing = False
@@ -80,9 +94,13 @@ class GuardWindow(QWidget):
         self._tray = None
         self._top_ticks = 0
         self._unregister_hotkey = None
+        self._daemon_pid = 0
+        self._threads_suspended = False
+        self._last_title_at = time.monotonic()
 
         self.setWindowTitle(APP_NAME)
-        self.resize(640, 520)
+        # v4.2: 窗口整体缩小约 10% (640x520 -> 576x468)
+        self.resize(576, 468)
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_DeleteOnClose, False)
         self.setAttribute(Qt.WA_QuitOnClose, False)
@@ -94,37 +112,40 @@ class GuardWindow(QWidget):
         self._register_hotkeys()
         self._setup_tray()
 
-        # 重活错开执行，先让首帧和按钮可见。
-        QTimer.singleShot(100, self._deferred_init)
-        QTimer.singleShot(250, self._load_recent_logs)
+        # ---------- 分阶段启动 ----------
+        # 首帧只做 UI; 其余按「越慢越靠后」错开, 让窗口尽快可见可点:
+        #   120ms 向守护进程报到 (先报到, 免得被看护误判为已死)
+        #   300ms 自身加固 + 自身窗口防捕获
+        #   500ms 回放最近的日志
+        #   900ms 虚拟桌面 COM 探测 (最慢, 用到才需要)
+        #  1200ms 自动开启防录屏
+        QTimer.singleShot(120, self._send_hello)
+        QTimer.singleShot(300, self._enable_self_protect)
+        QTimer.singleShot(500, self._load_recent_logs)
+        QTimer.singleShot(900, self._init_virtual_desktop)
+        QTimer.singleShot(1200, self._auto_start_record_protect)
 
         # 心跳 / 状态轮询
         self.ipc_timer = QTimer(self)
         self.ipc_timer.timeout.connect(self._ipc_tick)
         self.ipc_timer.start(2000)
 
-        # 置顶保持 (1秒, 标题随机化每10次)
+        # 置顶保持; 标题随机化按时间判定, 不再按 tick 计数
         self.top_timer = QTimer(self)
         self.top_timer.timeout.connect(self.keep_on_top)
-        self.top_timer.start(1000)
+        self.top_timer.start(TOP_KEEP_INTERVAL_MS)
 
         self.target_bottom_timer = QTimer(self)
         self.target_bottom_timer.timeout.connect(self._keep_target_minimized_bottom)
         self.target_bottom_timer.setInterval(250)
-
-        # 自动启动防录屏
-        QTimer.singleShot(1200, self._auto_start_record_protect)
 
         # 测试模式: 自动安全退出
         if TEST_AUTO_QUIT_MS > 0:
             logging.warning(f"[测试模式] {TEST_AUTO_QUIT_MS}ms 后自动退出")
             QTimer.singleShot(TEST_AUTO_QUIT_MS, self._request_quit)
 
-
-        # 首次心跳
-        QTimer.singleShot(300, self._send_hello)
-
         logging.info("🛡️ 界面进程启动完成 (守护进程独立运行)")
+        logging.info(f"📁 日志与状态目录: {DATA_DIR}")
         logging.info("💡 关闭窗口 = 收缩到托盘 | 只有「完全退出」才退出")
         logging.info("💡 热键: Ctrl+Alt+Y=显示 | Ctrl+Alt+K=杀进程 | "
                      "Ctrl+Alt+Q=恢复希沃并退出")
@@ -132,18 +153,28 @@ class GuardWindow(QWidget):
     # ==========================================
     # 延迟初始化 (窗口显示后执行, 不阻塞首帧)
     # ==========================================
-    def _deferred_init(self):
-        """窗口显示后执行的重活: 虚拟桌面 COM / 进程保护 / 自身防录屏"""
+    def _enable_self_protect(self):
+        """自身加固 (优先级/特权/缓解/PPL) + 自身窗口防捕获。
+
+        与虚拟桌面 COM 探测拆成两步, 避免一次性塞太多重活拖慢首屏。
+        """
+        try:
+            get_protection().enable()
+        except Exception as e:
+            logging.error(f"GUI 自身加固启用失败: {e}")
+        self._apply_self_affinity()
+
+    def _init_virtual_desktop(self):
+        """虚拟桌面 COM 探测 + 桌面列表刷新。
+
+        这是启动阶段最慢的一步 (要按 Windows 版本逐个试探 IID 与 vtable
+        布局), 且只有点「移动 / 新建桌面」时才用得到, 所以放得最靠后。
+        """
         try:
             self.vd.ensure_ready()
             self._refresh_desktops()
         except Exception as e:
             logging.debug(f"虚拟桌面延迟初始化失败: {e}")
-        try:
-            get_protection().enable()
-        except Exception as e:
-            logging.error(f"GUI 自身保护启用失败: {e}")
-        self._apply_self_affinity()
 
     def _load_recent_logs(self):
         self.log_box.load_recent(GUI_LOG)
@@ -156,20 +187,20 @@ class GuardWindow(QWidget):
         self.btn_kill_once = QPushButton("⚔️ 杀死进程 (单次)")
         self.btn_unpin = QPushButton("📌 取消置顶")
         self.btn_kill_forever = QPushButton("🔄 持续杀进程")
-        self.btn_launch_target = QPushButton("▶ 拉起希沃")
-        self.btn_resize_target = QPushButton("修改大小")
-        self.btn_minimize_bottom = QPushButton("最小化置底")
+        self.btn_launch_target = QPushButton("▶️ 拉起希沃")
+        self.btn_resize_target = QPushButton("🪟 修改大小")
+        self.btn_minimize_bottom = QPushButton("⬇️ 最小化置底")
         self.btn_block_record = QPushButton("🔒 防录屏")
+        self.btn_suspend = QPushButton("⏸️ 挂起线程")
 
-
-        self.lbl_daemon = QLabel("守护进程:")
+        self.lbl_daemon = QLabel("常驻进程:")
         self.lbl_daemon_status = QLabel("连接中...")
         self.lbl_daemon_status.setStyleSheet("color:orange;font-weight:bold;")
 
-        self.lbl_desk = QLabel("桌面:")
+        self.lbl_desk = QLabel("🖥️ 桌面:")
         self.cmb_desk = QComboBox()
-        self.btn_move_desk = QPushButton("移动")
-        self.btn_new_desk = QPushButton("新建桌面并移动")
+        self.btn_move_desk = QPushButton("📤 移动")
+        self.btn_new_desk = QPushButton("🆕 新建桌面并移动")
 
         self.btn_quit = QPushButton("❌ 完全退出程序")
         self.btn_quit.setStyleSheet(
@@ -188,17 +219,19 @@ class GuardWindow(QWidget):
         lay = QVBoxLayout()
         lay.setSpacing(8)
 
+        # 3x3 排列: 窗口缩小后 4 列会挤, 三列更整齐
         actions = QGridLayout()
         actions.setHorizontalSpacing(8)
         actions.setVerticalSpacing(8)
         actions.addWidget(self.btn_net, 0, 0)
         actions.addWidget(self.btn_kill_once, 0, 1)
         actions.addWidget(self.btn_kill_forever, 0, 2)
-        actions.addWidget(self.btn_launch_target, 0, 3)
-        actions.addWidget(self.btn_unpin, 1, 0)
-        actions.addWidget(self.btn_resize_target, 1, 1)
-        actions.addWidget(self.btn_minimize_bottom, 1, 2)
-        actions.addWidget(self.btn_block_record, 1, 3)
+        actions.addWidget(self.btn_launch_target, 1, 0)
+        actions.addWidget(self.btn_unpin, 1, 1)
+        actions.addWidget(self.btn_block_record, 1, 2)
+        actions.addWidget(self.btn_resize_target, 2, 0)
+        actions.addWidget(self.btn_minimize_bottom, 2, 1)
+        actions.addWidget(self.btn_suspend, 2, 2)
         lay.addLayout(actions)
 
         r2 = QHBoxLayout()
@@ -229,6 +262,7 @@ class GuardWindow(QWidget):
         self.btn_block_record.clicked.connect(self.on_block_record_toggle)
         self.btn_move_desk.clicked.connect(self.on_move_desktop)
         self.btn_new_desk.clicked.connect(self.on_new_desktop)
+        self.btn_suspend.clicked.connect(self.on_suspend_toggle)
         self.btn_quit.clicked.connect(self.on_full_quit)
 
     # ==========================================
@@ -333,11 +367,24 @@ class GuardWindow(QWidget):
             SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
             self._top_ticks += 1
-            # 每10秒随机化一次标题, 防止被按标题枚举检测
-            if self._top_ticks % 10 == 0:
-                title = ''.join(secrets.choice(string.ascii_letters + string.digits)
-                                for _ in range(secrets.randbelow(8) + 6))
-                self.setWindowTitle(title)
+
+            # 标题随机化: 按真实时间判定, 与定时器间隔解耦。
+            # 间隔见 config.TITLE_RANDOMIZE_SECONDS (v4.1 是 10 秒,
+            # 太慢容易被按标题枚举, v4.2 收紧到 2 秒)。
+            if TITLE_RANDOMIZE_SECONDS > 0:
+                now = time.monotonic()
+                if now - self._last_title_at >= TITLE_RANDOMIZE_SECONDS:
+                    self._last_title_at = now
+                    self._randomize_title()
+        except Exception:
+            pass
+
+    def _randomize_title(self):
+        """把窗口标题换成随机字符串, 防止被按标题枚举检测。"""
+        try:
+            title = ''.join(secrets.choice(string.ascii_letters + string.digits)
+                            for _ in range(secrets.randbelow(8) + 6))
+            self.setWindowTitle(title)
         except Exception:
             pass
 
@@ -369,12 +416,18 @@ class GuardWindow(QWidget):
         # 心跳 + 状态
         resp = self._client.request({"cmd": "gui_alive", "pid": os.getpid()})
         if resp is None:
-            self._set_daemon_down()
-            # 节流: 每5秒尝试拉起守护进程
-            if now - self._last_spawn_try > 5.0:
+            # 守护进程被拉起后需要数秒编译外载荷才就绪, 启动宽限期内
+            # (前 20 秒) 只提示等待, 不算故障
+            in_grace = (now - self._boot_monotonic) < 20.0
+            self._set_daemon_down(quiet=in_grace)
+            # 节流: 每 10 秒尝试拉起守护进程
+            if now - self._last_spawn_try > 10.0:
                 self._last_spawn_try = now
-                logging.warning("🔄 守护进程离线, 尝试重新拉起...")
-                spawn_hidden(daemon_cmd())
+                if in_grace:
+                    logging.info("⏳ 守护进程尚未就绪, 等待其完成启动...")
+                else:
+                    logging.warning("🔄 常驻进程离线, 尝试重新拉起...")
+                    spawn_hidden(daemon_cmd())
             return
 
         if self._daemon_down:
@@ -393,13 +446,15 @@ class GuardWindow(QWidget):
                     status["target_bottom"] = self._target_minimized
             self._update_daemon_status(status)
 
-    def _set_daemon_down(self):
+    def _set_daemon_down(self, quiet=False):
         if not self._daemon_down:
             self._daemon_down = True
+            if quiet:
+                return  # 启动宽限期内不打扰用户 (托盘气泡/红色状态留到真离线)
             self.lbl_daemon_status.setText("离线, 重启中...")
             self.lbl_daemon_status.setStyleSheet("color:red;font-weight:bold;")
             if self._tray:
-                self._tray.showMessage("SeewoGuard", "守护进程离线, 正在重启...",
+                self._tray.showMessage("SeewoGuard", "常驻进程离线, 正在重启...",
                                        QSystemTrayIcon.Warning, 3000)
 
     def _update_daemon_status(self, status):
@@ -407,12 +462,50 @@ class GuardWindow(QWidget):
         self._sync_target_bottom_from_daemon(
             bool(status.get("target_bottom", False)))
 
+        # 记住常驻进程 PID, 退出时要等它先走 (见 _wait_daemon_exit)
+        self._daemon_pid = pid if pid_alive(pid) else 0
+
         if pid_alive(pid):
             self.lbl_daemon_status.setText(f"运行中 (PID={pid})")
             self.lbl_daemon_status.setStyleSheet("color:green;font-weight:bold;")
         else:
             self.lbl_daemon_status.setText("异常")
             self.lbl_daemon_status.setStyleSheet("color:red;font-weight:bold;")
+
+    def _wait_daemon_exit(self, timeout=3.0):
+        """等常驻进程真正退出后再结束本进程。
+
+        单文件打包 (PyInstaller onefile) 时, 本进程退出后 bootloader 会
+        删除自己的 _MEI 临时目录。如果这时由本进程拉起的子进程还活着、
+        并且仍占用同一临时目录, 删除就会失败, 于是弹出
+        "Failed to remove temporary directory: ...\\_MEIxxxxxx"。
+
+        所以「完全退出」必须保证: 子进程先走, 本进程后走。
+        """
+        pid = self._daemon_pid
+        if not pid:
+            return
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not pid_alive(pid):
+                logging.info("✅ 常驻进程已退出")
+                self._daemon_pid = 0
+                return
+            time.sleep(0.05)
+        logging.warning(f"⚠️ 常驻进程 {pid} 未在 {timeout}s 内退出, 强制结束")
+        force_kill_process(pid)
+        # TerminateProcess 是异步的: 发出请求后进程不会立刻消失, 这里再确认
+        # 一小段时间, 否则本进程可能仍然先于它退出, 临时目录照样清不掉。
+        grace_deadline = time.monotonic() + 1.0
+        while time.monotonic() < grace_deadline:
+            if not pid_alive(pid):
+                logging.info("✅ 常驻进程已强制结束")
+                break
+            time.sleep(0.05)
+        else:
+            logging.error(f"❌ 常驻进程 {pid} 强制结束后依然存在, "
+                          "若打包版仍提示临时目录无法删除, 请手动结束该进程")
+        self._daemon_pid = 0
 
     # ==========================================
     # 功能按钮
@@ -460,11 +553,11 @@ class GuardWindow(QWidget):
         if not self._target_compact:
             if compact_target_windows() > 0:
                 self._target_compact = True
-                self.btn_resize_target.setText("最大化")
+                self.btn_resize_target.setText("🪟 最大化")
         else:
             if maximize_target_windows() > 0:
                 self._target_compact = False
-                self.btn_resize_target.setText("修改大小")
+                self.btn_resize_target.setText("🪟 修改大小")
 
     def on_minimize_bottom(self):
         self._set_target_bottom_mode(
@@ -477,7 +570,7 @@ class GuardWindow(QWidget):
     def _apply_target_bottom_local(self, enabled, maximize=False):
         if enabled:
             self._target_minimized = True
-            self.btn_minimize_bottom.setText("最大化置顶")
+            self.btn_minimize_bottom.setText("⬆️ 最大化置顶")
             minimize_target_windows_to_bottom()
             if not self.target_bottom_timer.isActive():
                 self.target_bottom_timer.start()
@@ -485,7 +578,7 @@ class GuardWindow(QWidget):
         was_enabled = self._target_minimized
         self.target_bottom_timer.stop()
         self._target_minimized = False
-        self.btn_minimize_bottom.setText("最小化置底")
+        self.btn_minimize_bottom.setText("⬇️ 最小化置底")
         if maximize and was_enabled:
             maximize_target_windows(force_topmost=True)
 
@@ -512,6 +605,36 @@ class GuardWindow(QWidget):
         logging.info("📌 取消置顶 (ZBID双重模式)")
         for p in TARGET_EXES:
             set_zbid_and_notopmost(p)
+
+    # ==========================================
+    # 线程挂起 / 恢复
+    # ==========================================
+    def on_suspend_toggle(self):
+        if self._threads_suspended:
+            self._resume_threads()
+        else:
+            self._suspend_threads()
+
+    def _suspend_threads(self):
+        """挂起希沃全部线程: 进程还在但不执行, 比持续杀进程省资源。"""
+        logging.info("⏸️ 正在挂起目标线程...")
+        n = suspend_target_threads()
+        if n == 0:
+            logging.warning("⚠️ 没有挂起任何线程: 目标进程可能未运行, "
+                            "或权限不足 (需要管理员)")
+            return
+        self._threads_suspended = True
+        self.btn_suspend.setText("▶️ 恢复线程")
+        self.btn_suspend.setStyleSheet("color:darkred;font-weight:bold;")
+        logging.info(f"✅ 已挂起 {n} 个线程 (希沃已冻结)")
+
+    def _resume_threads(self):
+        logging.info("▶️ 正在恢复目标线程...")
+        n = resume_target_threads()
+        self._threads_suspended = False
+        self.btn_suspend.setText("⏸️ 挂起线程")
+        self.btn_suspend.setStyleSheet("")
+        logging.info(f"✅ 已恢复 {n} 个线程")
 
     def on_block_record_toggle(self):
         if not self._record_blocked:
@@ -544,7 +667,15 @@ class GuardWindow(QWidget):
         self.btn_block_record.setText("🔓 停止防录屏")
         self.btn_block_record.setStyleSheet("color:darkred;font-weight:bold;")
         mode = "透明" if transparent > 0 else "黑色兜底"
-        logging.warning(f"✅ 防录屏已启用 ({mode}模式, 共 {total} 个窗口)")
+        if total == 0:
+            # GUI 启动 1.2s 后首次执行时希沃窗口可能尚未出现, 属正常现象
+            logging.info(f"✅ 防录屏已启用 ({mode}模式), 暂未发现希沃窗口, "
+                         f"后台将每 2 秒自动复查")
+        elif transparent == 0:
+            logging.warning(f"✅ 防录屏已启用 (黑色兜底模式, 共 {total} 个窗口; "
+                            f"透明模式不可用)")
+        else:
+            logging.info(f"✅ 防录屏已启用 (透明模式, 共 {total} 个窗口)")
 
     def _disable_record_block(self):
         logging.info("🔓 关闭防录屏...")
@@ -643,7 +774,7 @@ class GuardWindow(QWidget):
         self._request_quit()
 
     def _request_quit(self):
-        """安全退出: 通知守护进程关闭, 然后退出本进程"""
+        """安全退出: 通知常驻进程关闭并等它先退出, 再结束本进程"""
         logging.info("👋 请求完全退出...")
         self._quitting = True  # 完全退出中: closeEvent 不再拦截
         self._kill_stop.set()
@@ -655,9 +786,17 @@ class GuardWindow(QWidget):
         if self._target_minimized:
             self._set_target_bottom_mode(False, maximize=True)
 
-        # 通知守护进程退出
+        if self._threads_suspended:
+            logging.warning("⚠️ 目标线程仍处于挂起状态, 退出后希沃将保持冻结; "
+                            "需要恢复请重新运行本程序并点「▶️ 恢复线程」")
+
+        # 通知常驻进程退出
         resp = self._client.request({"cmd": "shutdown", "pid": os.getpid()})
-        logging.info(f"🛑 守护进程关闭指令: {'已送达' if resp else '未送达(可能已退出)'}")
+        logging.info(f"🛑 常驻进程关闭指令: {'已送达' if resp else '未送达(可能已退出)'}")
+
+        # 必须等常驻进程真的退出: 否则本进程的 bootloader 清理 _MEI 临时
+        # 目录时会失败并弹出 "Failed to remove temporary directory"
+        self._wait_daemon_exit()
 
         try:
             if self._tray:
@@ -719,7 +858,7 @@ def gui_main(started_at=None):
     _t0 = started_at if started_at is not None else time.monotonic()
 
     logging.info("=" * 60)
-    logging.info(f"  SeewoGuard GUI 进程 v{getattr(__import__('seewo_guard.config'), 'VERSION', '4.1')}")
+    logging.info(f"  SeewoGuard GUI 进程 v{VERSION}")
     logging.info(f"  PID: {os.getpid()}  会话: {get_session_id()}")
     logging.info("=" * 60)
 

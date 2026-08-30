@@ -1,7 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 utils.py - 通用工具
-包含: 会话ID / 控制台隐藏 / 提权 / 单实例锁 / 隐藏启动 / 窗口激活
+包含: 会话ID / 控制台隐藏 / 提权 / 单实例锁 / 隐藏启动 / 窗口激活 /
+      打包器环境变量清理
+
+关于环境变量清理: 单文件打包 (PyInstaller / Nuitka onefile) 之后, 拉起子
+进程前必须剔除 _PYI_* 与 NUITKA_* 变量。否则子进程的 bootloader 会误判
+自己仍在同一个进程树里而跳过临时目录解压, 直接初始化嵌入解释器,
+必然失败 ("Failed to start embedded Python interpreter")。
 """
 import os
 import signal
@@ -71,13 +77,20 @@ def hidden_creationflags():
 # ==========================================
 # 打包器环境变量清理 (PyInstaller / Nuitka onefile)
 # ==========================================
-# 单文件打包后, 当前 Python 子进程会继承 bootloader 的内部环境变量
-# (_PYI_ARCHIVE_FILE / _PYI_PARENT_PROCESS_LEVEL / _PYI_APPLICATION_HOME_DIR,
-#  Nuitka onefile 为 NUITKA_* 系列)。
-# 若不清理, 由本程序拉起的 exe 会被 bootloader 误判为"同一进程树的子进程",
-# 从而跳过临时目录解压, 直接初始化 Python -> 必然失败
-# ("Failed to start embedded Python interpreter"), 并连带临时目录无法移除。
-_STRIP_ENV_PREFIXES = ("_PYI_", "NUITKA_")
+# 单文件打包后, 本进程的环境里带着 bootloader 注入的内部变量:
+#   PyInstaller 6.x : _PYI_ARCHIVE_FILE / _PYI_PARENT_PROCESS_LEVEL
+#                     / _PYI_APPLICATION_HOME_DIR
+#   PyInstaller 5.x : _MEIPASS2
+#   Nuitka onefile  : NUITKA_* 系列
+# 子进程若继承这些变量, 会被判定为"同一进程树", 直接复用父进程已解压好的
+# _MEI 临时目录而不再自己解压。
+#
+# 实测 (PyInstaller 6.20) 的两个后果:
+#   1) 父进程先退出时, 其 bootloader 会去删除这个仍被子进程占用的临时目录,
+#      删除失败 -> 窗口程序弹出 "Failed to remove temporary directory";
+#   2) 目录被父进程清掉后, 子进程再初始化解释器会直接失败。
+# 因此凡是拉起本程序自身 (常驻进程 / GUI / 提权后的新实例) 都必须清干净。
+_STRIP_ENV_PREFIXES = ("_PYI_", "_MEIPASS2", "NUITKA_")
 
 
 def _strip_packager_env(env):
@@ -277,10 +290,18 @@ def pid_alive(pid):
 
 
 def kill_pid(pid):
-    """强制结束指定 PID (os.kill: SIGTERM 后直接 SIGKILL, 无间隔)"""
+    """终止指定 PID (与 window_ops.force_kill_process 实现相同)。
+
+    Windows 的 signal 模块没有 SIGKILL, os.kill 只有 SIGTERM 生效
+    (对应 TerminateProcess); 第二行会抛 AttributeError 并被吞掉。
+
+    注意: 当前代码中没有任何地方调用本函数, GUI 走的是
+    window_ops.force_kill_process。保留它是为了与 force_kill_process
+    保持一致的工具入口, 修改时请两处同步。
+    """
     try:
-        os.kill(pid, signal.SIGTERM)
-        os.kill(pid, signal.SIGKILL)
+        os.kill(pid, signal.SIGTERM)   # Windows -> TerminateProcess
+        os.kill(pid, signal.SIGKILL)   # Windows 下必然抛 AttributeError
     except ProcessLookupError:
         pass
     except (PermissionError, OSError):

@@ -1,0 +1,230 @@
+name: Release
+
+# ==========================================================================
+#  正式发布工作流
+#  - 仅支持手动触发 (workflow_dispatch)
+#  - 输入版本号后执行与预发布相同的打包流程
+#  - 产出: Ubuntu / Windows / macOS 三端构建产物 + 一个 latest 正式 Release
+# ==========================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号 (SemVer, 例如 1.2.0; 可带 v 前缀)'
+        required: true
+        type: string
+      tool:
+        description: '打包工具'
+        required: true
+        default: 'pyinstaller'
+        type: choice
+        options:
+          - pyinstaller
+          - nuitka
+      mode:
+        description: '打包模式'
+        required: true
+        default: 'onefile'
+        type: choice
+        options:
+          - onefile
+          - onedir
+      notes:
+        description: '发布说明 (留空则自动生成)'
+        required: false
+        default: ''
+        type: string
+
+# 创建 Release 需要写权限
+permissions:
+  contents: write
+
+# 正式发布不允许被中途取消, 因此只排队不打断;
+# 同版本号重复触发时后到的任务会被自动取消, 避免重复打标签。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.11'
+  TOOL: ${{ inputs.tool }}
+  MODE: ${{ inputs.mode }}
+
+jobs:
+  # ---------------------------------------------------------- 版本号校验
+  verify:
+    name: 校验版本号
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 规范化并校验版本号
+        id: check
+        env:
+          RAW_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # 去掉可选的 v 前缀与首尾空白
+          VERSION="$(echo "${RAW_VERSION}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^[vV]//')"
+          TAG="v${VERSION}"
+
+          if [ -z "${VERSION}" ]; then
+            echo "::error::版本号不能为空"
+            exit 1
+          fi
+
+          # 要求形如 1.2.0 或 1.2.0-rc.1
+          if ! echo "${VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::版本号 '${VERSION}' 不符合 SemVer 规范"
+            echo "::error::正确示例: 1.0.0 / 1.2.0 / 2.0.0-rc.1"
+            exit 1
+          fi
+
+          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q "refs/tags/${TAG}"; then
+            echo "::error::标签 ${TAG} 已存在, 请更换版本号"
+            exit 1
+          fi
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "::error::Release ${TAG} 已存在, 请更换版本号"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "正式发布版本号: ${TAG}"
+
+  # ---------------------------------------------------------------- 构建
+  build:
+    name: 构建 (${{ matrix.name }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux x86_64
+            artifact: SeewoGuard-linux-x86_64
+          - os: windows-latest
+            name: Windows x86_64
+            artifact: SeewoGuard-windows-x86_64
+          - os: macos-latest
+            name: macOS arm64
+            artifact: SeewoGuard-macos-arm64
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: 安装依赖与打包工具
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller nuitka
+
+      - name: 打包 (${{ env.TOOL }} / ${{ env.MODE }})
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${MODE}" = "onedir" ]; then
+            python build.py --tool "${TOOL}" --onedir
+          else
+            python build.py --tool "${TOOL}" --onefile
+          fi
+
+      - name: 压缩产物
+        shell: bash
+        env:
+          ARTIFACT_NAME: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          python -c "import os, shutil; os.makedirs('release', exist_ok=True); shutil.make_archive(os.path.join('release', os.environ['ARTIFACT_NAME']), 'zip', 'dist')"
+          ls -lh release/
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: release/*.zip
+          if-no-files-found: error
+          retention-days: 90
+
+  # ---------------------------------------------------------------- 发布
+  release:
+    name: 创建正式发布
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载全部构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 生成发布说明
+        env:
+          TAG: ${{ needs.verify.outputs.tag }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          INPUT_NOTES: ${{ inputs.notes }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_NOTES}" ]; then
+            printf '%s\n' "${INPUT_NOTES}" > notes.md
+          else
+            {
+              echo "## SeewoGuard ${TAG}"
+              echo
+              echo "| 项目 | 值 |"
+              echo "| --- | --- |"
+              echo "| 版本号 | \`${VERSION}\` |"
+              echo "| 提交 | \`${GITHUB_SHA}\` |"
+              echo "| 分支 | \`${GITHUB_REF_NAME}\` |"
+              echo "| 打包工具 | \`${TOOL}\` |"
+              echo "| 打包模式 | \`${MODE}\` |"
+              echo "| 发布时间 | $(date -u +'%Y-%m-%d %H:%M:%S') UTC |"
+              echo
+              echo "### 产物说明"
+              echo
+              echo "- \`SeewoGuard-windows-x86_64.zip\` - Windows 平台 (功能完整)"
+              echo "- \`SeewoGuard-linux-x86_64.zip\` - Linux 平台"
+              echo "- \`SeewoGuard-macos-arm64.zip\` - macOS 平台 (Apple Silicon)"
+              echo
+              echo "### 使用提示"
+              echo
+              echo "1. Windows 用户请解压后右键以管理员身份运行 \`seewokiller_pyinstaller.exe\`。"
+              echo "2. 请确保 \`seewokiller_pyinstaller.exe\`、\`icon.ico\`、\`uiaccess.dll\` 位于同一目录。"
+              echo "3. 本项目功能依赖 Windows API, Linux / macOS 产物仅用于验证构建链路。"
+            } > notes.md
+          fi
+          cat notes.md
+
+      - name: 创建 latest Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --title "SeewoGuard $VERSION" \
+            --notes-file notes.md \
+            --latest \
+            --target "$GITHUB_SHA" \
+            artifacts/*/*.zip
+          echo "已发布正式版本: $TAG"

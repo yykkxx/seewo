@@ -1,10 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-protection.py - 进程保护层 (GUI 与守护进程共用)
-Layer 1: 高优先级
-Layer 2: 特权提升
-Layer 3: 缓解策略 (DEP/ASLR/严格句柄/CFG)
-Layer 4: PPL 尝试 (失败不影响运行)
+protection.py - 进程加固 (GUI 与守护进程共用)
+
+四层内容:
+  Layer 1  提升进程优先级 (HIGH_PRIORITY_CLASS)
+  Layer 2  启用 SeDebugPrivilege 等特权
+  Layer 3  进程缓解策略: DEP / ASLR / 严格句柄检查 / CFG
+  Layer 4  尝试设置 PPL 保护 (需微软签名证书, 通常失败)
+
+「加固」不等于「防结束」, 两者要分开看:
+  上面四层都**不能**阻止任务管理器或 taskkill 结束本进程。其中
+  SeDebugPrivilege 的主要用途是让本进程有权 TerminateProcess 掉其它
+  进程 (杀希沃进程需要它), 并不提供自我保护; DEP/ASLR/CFG 属于漏洞
+  缓解, 与终止无关; 唯一能真正阻止第三方结束进程的是 PPL, 但它要求
+  二进制带微软签名, 实际几乎总是失败 (代码已按「失败不影响运行」处理)。
+
+  真正让本程序在任务管理器里「结束不掉」的是另一套机制: 守护进程监控
+  GUI 心跳, GUI 被结束后由守护进程重新拉起 (见 daemon._watchdog_tick)。
+  本模块只负责加固与提权。
 """
 import ctypes
 import logging
@@ -29,7 +42,7 @@ from ctypes import wintypes as _wintypes
 
 
 class ProcessProtection:
-    """进程保护管理器 (优先级/特权/缓解/PPL)"""
+    """进程加固管理器 (优先级/特权/缓解/PPL), 详见模块文档字符串"""
 
     def __init__(self):
         self._privileges_granted = []

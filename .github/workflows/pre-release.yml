@@ -1,0 +1,226 @@
+name: Pre-Release
+
+# ==========================================================================
+#  预发布工作流
+#  - push 到主分支时自动触发
+#  - 每周日定时触发 (cron, UTC 时间)
+#  - 也可手动触发 (workflow_dispatch)
+#  产出: Ubuntu / Windows / macOS 三端构建产物 + 一个标记为 prerelease 的 Release
+# ==========================================================================
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  schedule:
+    # GitHub Actions 的 cron 一律按 UTC 执行:
+    #   每周日 03:00 UTC = 北京时间每周日 11:00
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+    inputs:
+      tool:
+        description: '打包工具'
+        required: false
+        default: 'pyinstaller'
+        type: choice
+        options:
+          - pyinstaller
+          - nuitka
+      mode:
+        description: '打包模式'
+        required: false
+        default: 'onefile'
+        type: choice
+        options:
+          - onefile
+          - onedir
+      prune_old:
+        description: '创建前删除历史预发布版本'
+        required: false
+        default: true
+        type: boolean
+
+# 创建 Release 需要写权限
+permissions:
+  contents: write
+
+# 同一分支上新的构建开始时, 取消仍在排队的旧构建, 避免重复占用 runner
+concurrency:
+  group: pre-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.11'
+  TOOL: ${{ inputs.tool || 'pyinstaller' }}
+  MODE: ${{ inputs.mode || 'onefile' }}
+
+jobs:
+  # ---------------------------------------------------------------- 版本号
+  version:
+    name: 生成版本号
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.gen.outputs.version }}
+      tag: ${{ steps.gen.outputs.tag }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 生成日期 + commit SHA 版本号
+        id: gen
+        run: |
+          set -euo pipefail
+          DATE="$(date -u +'%Y.%m.%d')"
+          SHA="$(git rev-parse --short=7 HEAD)"
+          VERSION="${DATE}-${SHA}"
+          TAG="v${VERSION}"
+
+          # 定时触发时同一 commit 可能重复构建, 冲突则追加运行序号
+          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q "refs/tags/${TAG}"; then
+            VERSION="${DATE}-${SHA}-${GITHUB_RUN_NUMBER}"
+            TAG="v${VERSION}"
+            echo "标签已存在, 追加运行序号: ${TAG}"
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "预发布版本号: ${TAG}"
+
+  # ---------------------------------------------------------------- 构建
+  build:
+    name: 构建 (${{ matrix.name }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux x86_64
+            artifact: SeewoGuard-linux-x86_64
+          - os: windows-latest
+            name: Windows x86_64
+            artifact: SeewoGuard-windows-x86_64
+          - os: macos-latest
+            name: macOS arm64
+            artifact: SeewoGuard-macos-arm64
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: 安装依赖与打包工具
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller nuitka
+
+      - name: 打包 (${{ env.TOOL }} / ${{ env.MODE }})
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${MODE}" = "onedir" ]; then
+            python build.py --tool "${TOOL}" --onedir
+          else
+            python build.py --tool "${TOOL}" --onefile
+          fi
+
+      - name: 压缩产物
+        shell: bash
+        env:
+          ARTIFACT_NAME: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          python -c "import os, shutil; os.makedirs('release', exist_ok=True); shutil.make_archive(os.path.join('release', os.environ['ARTIFACT_NAME']), 'zip', 'dist')"
+          ls -lh release/
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: release/*.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------- 发布
+  release:
+    name: 创建预发布
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载全部构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 生成发布说明
+        id: notes
+        run: |
+          set -euo pipefail
+          {
+            echo "## 预发布 ${TAG}"
+            echo
+            echo "由 \`${GITHUB_WORKFLOW}\` 自动构建, 仅供测试, 请勿用于生产环境。"
+            echo
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 版本号 | \`${TAG}\` |"
+            echo "| 提交 | \`${GITHUB_SHA}\` |"
+            echo "| 分支 | \`${GITHUB_REF_NAME}\` |"
+            echo "| 打包工具 | \`${TOOL}\` |"
+            echo "| 打包模式 | \`${MODE}\` |"
+            echo "| 构建时间 | $(date -u +'%Y-%m-%d %H:%M:%S') UTC |"
+            echo
+            echo "### 产物说明"
+            echo
+            echo "- \`SeewoGuard-windows-x86_64.zip\` - Windows 平台"
+            echo "- \`SeewoGuard-linux-x86_64.zip\` - Linux 平台"
+            echo "- \`SeewoGuard-macos-arm64.zip\` - macOS 平台 (Apple Silicon)"
+            echo
+            echo "> 本项目功能依赖 Windows API, Linux / macOS 产物仅用于验证"
+            echo "> 构建链路可用性, 无法实际运行。"
+          } > notes.md
+          cat notes.md
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+
+      - name: 清理历史预发布
+        if: ${{ inputs.prune_old || github.event_name != 'workflow_dispatch' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release list --limit 100 \
+            --json tagName,isPrerelease \
+            --jq '.[] | select(.isPrerelease) | .tagName' > old_tags.txt || true
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            echo "删除历史预发布: $tag"
+            gh release delete "$tag" --yes --cleanup-tag || true
+          done < old_tags.txt
+
+      - name: 创建 prerelease Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # 打包产物直接放在 artifacts/ 的一级子目录中
+          gh release create "$TAG" \
+            --title "Pre-release $VERSION" \
+            --notes-file notes.md \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            artifacts/*/*.zip
+          echo "已创建预发布: $TAG"

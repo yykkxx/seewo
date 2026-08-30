@@ -1,14 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-daemon.py - 守护进程 (v4.1 双进程架构核心)
+daemon.py - 常驻进程 (v4.3 双进程架构中的无界面进程)
+
+核心作用: 让 GUI 在任务管理器里「结束不掉」。GUI 被结束后, 本进程在下一
+          个心跳周期把它重新拉起。这是本项目唯一的抗结束手段 ——
+          protection.py 的四层加固并不阻止进程被结束。
+
+退出顺序: GUI「完全退出」时会先发 shutdown 指令并等本进程真正退出,
+          然后才结束自己。顺序不能反: 否则打包版的 bootloader 清理
+          临时目录会失败 (详见 gui_app._wait_daemon_exit)。
 
 职责:
-  1. 无界面常驻后台, 独立于 GUI 进程 (任务管理器结束 GUI 不影响守护)
-  2. 隐藏窗口消息循环监听系统关机/注销 (WM_QUERYENDSESSION / WM_ENDSESSION),
-     收到后自动安全退出
-  3. 通过本地回环 TCP IPC 响应 GUI 指令: 状态查询 / GUI 注册 / 安全退出
-  4. 监控 GUI 心跳: GUI 被任务管理器结束等异常退出时自动重新拉起,
-     连续崩溃超过 MAX_GUI_RESTARTS 次则自行安全退出
+  1. 无界面常驻后台, 独立于 GUI 进程 (结束 GUI 不影响本进程)
+  2. 隐藏窗口消息循环监听关机 / 注销 (WM_QUERYENDSESSION / WM_ENDSESSION),
+     收到后安全退出; 隐藏窗口创建失败时回退为控制台 Ctrl 处理器
+  3. 承载本地回环 TCP 的 IPC 服务端, 响应 GUI 指令:
+     status / gui_hello / gui_alive / set_target_bottom / shutdown
+  4. 监控 GUI 心跳: 超过 DAEMON_GUI_TIMEOUT 没收到心跳就重新拉起 GUI;
+     连续超过 MAX_GUI_RESTARTS 次则自行退出, 避免无限重启
+  5. 把 target_bottom (希沃窗口最小化置底开关) 持久化到 STATE_FILE
+     以便重启后恢复, 退出时清理该文件
+  6. 启动时调用 protection.enable() 做自身加固与提权
 
 安全说明:
   本项目已彻底移除关键进程 (RtlSetProcessIsCritical) 代码,

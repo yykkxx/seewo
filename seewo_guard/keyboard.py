@@ -2,12 +2,14 @@
 """
 keyboard.py - 全局键盘监听 (WH_KEYBOARD_LL)
 
-低级键盘钩子挂在系统钩子链末端, 可绕过普通应用层键盘钩子/过滤器:
-- 其他进程的应用层钩子无法屏蔽本钩子收到的按键
-- 检测到本程序热键组合时直接吞掉按键 (返回 1), 其他软件也收不到
-- 驱动级键盘过滤驱动无法通过钩子绕过 (需内核驱动, 属 C++ 版范畴)
+低级键盘钩子在按键被派发到任何线程之前收到通知, 因此先于普通应用层
+钩子或键盘过滤器拿到按键; 钩子链中「后安装的先收到」。
+- 命中本程序热键时回调返回 1, 按键不再向下传递, 其它软件收不到
+- 未命中则 CallNextHookEx 交还给钩子链, 不影响正常输入
+- 内核/驱动级键盘过滤运行在本层之下, 无法用钩子绕过
 
-热键通过 PostMessage 发送 WM_APP+0x100 通知 GUI 主窗口 (线程安全)。
+命中后通过 PostMessage 发送 WM_APP+0x100 通知 GUI 主窗口,
+避免在钩子线程里直接操作界面 (钩子线程自带消息循环)。
 """
 import ctypes
 import logging
@@ -30,10 +32,14 @@ VK_K = 0x4B
 VK_Q = 0x51
 
 # 热键 ID -> (Ctrl, Alt, 主键)
+# ID 与 gui_app.nativeEvent 的分支一一对应, 改这里要同步改那边:
+#   1 显示窗口
+#   2 杀一轮进程
+#   3 停止持续杀进程 + 拉起希沃 + 退出 (不只是退出, 见 on_hotkey_quit)
 HOTKEYS = {
     1: (VK_CONTROL, VK_MENU, VK_Y),  # 显示窗口
-    2: (VK_CONTROL, VK_MENU, VK_K),  # 杀进程
-    3: (VK_CONTROL, VK_MENU, VK_Q),  # 完全退出
+    2: (VK_CONTROL, VK_MENU, VK_K),  # 杀一轮进程
+    3: (VK_CONTROL, VK_MENU, VK_Q),  # 停止持续杀进程 + 拉起希沃 + 退出
 }
 
 
@@ -152,7 +158,10 @@ class KeyboardHook:
                 if self._record_keys:
                     logging.debug(f"按键: vk={vk:#x} sc={kb.scanCode:#x}")
                 for hid, (ctrl, alt, key) in HOTKEYS.items():
-                    if vk == key and                             (user32.GetAsyncKeyState(ctrl) & 0x8000) and                             (user32.GetAsyncKeyState(alt) & 0x8000):
+                    # 0x8000 位为 1 表示该键当前处于按下状态
+                    ctrl_down = user32.GetAsyncKeyState(ctrl) & 0x8000
+                    alt_down = user32.GetAsyncKeyState(alt) & 0x8000
+                    if vk == key and ctrl_down and alt_down:
                         user32.PostMessageW(self._target_hwnd,
                                             WM_APP_HOTKEY, hid, 0)
                         return 1  # 吞掉按键, 其他软件收不到

@@ -1,3 +1,9 @@
-PySide6>=6.5
-psutil>=5.9
-pywin32
+# SeewoGuard 运行时依赖
+# 说明:
+#   1. 版本下限依据代码实际用到的 API 设定, 上限不限以便跟随生态升级。
+#   2. build.py 会读取本文件校验依赖是否已安装, CI 也以此文件作为 pip 缓存键。
+#   3. 打包工具 (PyInstaller / Nuitka) 属于构建期依赖, 不在此列出, 由
+#      .github/workflows/ 或本地 `pip install pyinstaller nuitka` 单独安装。
+
+PySide6>=6.5.0
+psutil>=5.9.0

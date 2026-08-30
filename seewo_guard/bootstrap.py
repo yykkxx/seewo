@@ -3,6 +3,19 @@
 
 该模块不导入 PySide6、psutil 或 GUI 模块，确保普通管理员进程在跳转到
 UIAccess 实例前不会重复支付完整 GUI 导入成本。
+
+启动链:
+    普通进程
+      -> 若非管理员: ShellExecuteW(runas) 请求 UAC, 当前进程退出
+      -> 若已是管理员: 用 uiaccess.dll 的 StartUIAccessProcess 拉起一个
+         UIAccess 实例, 并由它运行真正的 GUI, 当前进程退出
+
+为什么需要 UIAccess: 只有 UIAccess 完整性级别的进程才能在窗口 Z 序上
+压过同样以高完整性运行的希沃窗口。希沃会周期性把窗口重新置顶, 普通
+管理员进程的 SetWindowPos 会被它覆盖; 拿到 UIAccess 后本程序的
+「最小化置底」才能压住 (见 window_ops.minimize_target_windows_to_bottom)。
+UIAccess 要求可执行文件位于受信任目录 (Program Files 等), 拉不起来时会
+跳过并直接用当前管理员进程运行 GUI, 功能降级但不报错。
 """
 import ctypes
 import os

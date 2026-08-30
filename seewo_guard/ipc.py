@@ -10,6 +10,7 @@ import json
 import logging
 import socket
 import threading
+import time
 
 from seewo_guard.config import IPC_PORT_BASE
 from seewo_guard.utils import get_session_id
@@ -111,14 +112,21 @@ class IpcServer:
 class IpcClient:
     """TCP 客户端: 每次 request 一条请求"""
 
+    # 连续失败日志的节流间隔 (秒): 守护进程启动需要数秒, 期间的连接拒绝
+    # 属正常现象, 不值得每 2 秒刷一条
+    _FAIL_LOG_INTERVAL = 30.0
+
     def __init__(self, address=None, timeout=3.0):
         self._address = address or ipc_address()
         self._timeout = timeout
+        self._fail_streak = 0        # 连续失败次数 (成功后归零)
+        self._last_fail_log = 0.0    # 上次记录失败日志的时刻
 
     def request(self, payload) -> dict:
         """发送请求并等待响应, 失败返回 None"""
         try:
             with socket.create_connection(self._address, timeout=self._timeout) as s:
+                self._fail_streak = 0
                 s.settimeout(self._timeout)
                 data = json.dumps(payload, ensure_ascii=False).encode('utf-8') + b"\n"
                 s.sendall(data)
@@ -133,7 +141,11 @@ class IpcClient:
                         return json.loads(line.decode('utf-8', errors='replace'))
                 return None
         except (OSError, ValueError) as e:
-            logging.debug(f"IPC 请求失败: {e}")
+            self._fail_streak += 1
+            now = time.monotonic()
+            if self._fail_streak == 1 or now - self._last_fail_log >= self._FAIL_LOG_INTERVAL:
+                logging.debug(f"IPC 请求失败 (连续第 {self._fail_streak} 次): {e}")
+                self._last_fail_log = now
             return None
 
     def alive(self) -> bool:

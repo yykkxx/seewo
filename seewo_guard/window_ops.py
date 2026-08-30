@@ -30,11 +30,14 @@ from seewo_guard.win_api import (
     SW_MINIMIZE, SW_RESTORE, SW_MAXIMIZE,
     MonitorFromWindow, GetMonitorInfoW, MONITORINFO,
     MONITOR_DEFAULTTONEAREST,
+    TH32CS_SNAPTHREAD, THREAD_SUSPEND_RESUME, INVALID_HANDLE_VALUE,
+    THREADENTRY32, CreateToolhelp32Snapshot, Thread32First, Thread32Next,
+    OpenThread, SuspendThread, ResumeThread, CloseHandle,
     wintypes,
 )
 from ctypes import wintypes as _wintypes
 from seewo_guard.utils import (
-    hidden_startupinfo, hidden_creationflags, spawn_hidden,
+    hidden_startupinfo, hidden_creationflags, spawn_hidden, clean_child_env,
 )
 
 
@@ -240,7 +243,15 @@ def set_window_display_affinity_all(exe_path, affinity=WDA_MONITOR):
 
 
 def set_zbid_and_notopmost(exe_path):
-    """双重取消置顶: SetWindowBand 降级 + TOPMOST 立即取消"""
+    """双重取消置顶: SetWindowBand 降级 + TOPMOST 立即取消。
+
+    两步都在同一个 exe 的**第一个**窗口句柄上执行 (hwnds[0]), 不是全部
+    窗口; 若要覆盖所有窗口需要在这里改成循环。
+
+    「先设 TOPMOST 再设 NOTOPMOST」是有意为之: 目标窗口处于高 ZBID 时,
+    直接设 NOTOPMOST 往往无效, 先顶起来再放下可以强制窗口管理器刷新
+    Z 序状态。SetWindowBand 属于未公开 API, 取不到就直接跳过。
+    """
     hwnds = find_all_windows_by_path(exe_path, visible=False)
     if not hwnds:
         return
@@ -264,10 +275,18 @@ def set_zbid_and_notopmost(exe_path):
 
 
 def force_kill_process(pid):
-    """强制终止指定 PID (os.kill: SIGTERM 后直接 SIGKILL, 无间隔)"""
+    """终止指定 PID。
+
+    Windows 的 signal 模块没有 SIGKILL, os.kill 只支持 SIGTERM
+    (底层为 TerminateProcess, 立即结束、无法被目标拦截)。
+    第二行 signal.SIGKILL 在 Windows 上会抛 AttributeError, 并被下面的
+    except Exception 吞掉, 因此实际生效的只有第一行。
+    目标进程重新启动由对方自身的看护机制负责, 所以杀进程要周期性执行
+    (见 kill_pass 与 GUI 的「持续杀进程」)。
+    """
     try:
-        os.kill(pid, signal.SIGTERM)
-        os.kill(pid, signal.SIGKILL)
+        os.kill(pid, signal.SIGTERM)   # Windows -> TerminateProcess
+        os.kill(pid, signal.SIGKILL)   # Windows 下必然抛 AttributeError
     except ProcessLookupError:
         pass
     except (PermissionError, OSError):
@@ -289,13 +308,108 @@ def kill_pass(stop_event=None):
 
 
 # ==========================================
+# 线程挂起 / 恢复 (冻结而不结束)
+# ==========================================
+def _snapshot_threads():
+    """快照系统全部线程, 返回 [(线程ID, 所属进程ID), ...]; 失败返回 []。"""
+    snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+    if not snap or snap == INVALID_HANDLE_VALUE:
+        return []
+    items = []
+    try:
+        entry = THREADENTRY32()
+        entry.dwSize = ctypes.sizeof(entry)
+        ok = Thread32First(snap, ctypes.byref(entry))
+        while ok:
+            items.append((entry.th32ThreadID, entry.th32OwnerProcessID))
+            entry = THREADENTRY32()
+            entry.dwSize = ctypes.sizeof(entry)
+            ok = Thread32Next(snap, ctypes.byref(entry))
+    except Exception as e:
+        logging.debug(f"线程快照遍历失败: {e}")
+    finally:
+        CloseHandle(snap)
+    return items
+
+
+def target_thread_ids():
+    """返回全部目标进程的线程 ID 列表。"""
+    target_pids = set()
+    for exe in TARGET_EXES:
+        target_pids.update(get_pids_by_path(exe))
+    if not target_pids:
+        return []
+    return [tid for tid, pid in _snapshot_threads() if pid in target_pids]
+
+
+def suspend_target_threads():
+    """挂起目标进程的全部线程, 返回成功挂起的线程数。
+
+    与杀进程的区别: 进程仍在列表里但停止执行, 对方的看护按"进程是否还
+    在"判断存活, 所以挂起不会被重启, 比持续杀进程更省资源。
+
+    注意: 挂起计数是可累加的, 同一线程被挂起 n 次就要恢复 n 次,
+    因此恢复时统一走 resume_target_threads 循环减到 0。
+    """
+    count = 0
+    for tid in target_thread_ids():
+        handle = OpenThread(THREAD_SUSPEND_RESUME, False, tid)
+        if not handle:
+            continue
+        try:
+            # 返回值是挂起前的计数, 0xFFFFFFFF (-1) 表示失败
+            if SuspendThread(handle) != 0xFFFFFFFF:
+                count += 1
+        except Exception:
+            pass
+        finally:
+            CloseHandle(handle)
+    logging.info(f"⏸️ 已挂起 {count} 个目标线程")
+    return count
+
+
+def resume_target_threads():
+    """恢复目标进程被挂起的线程, 返回已完全恢复运行的线程数。"""
+    count = 0
+    for tid in target_thread_ids():
+        handle = OpenThread(THREAD_SUSPEND_RESUME, False, tid)
+        if not handle:
+            continue
+        try:
+            while True:
+                prev = ResumeThread(handle)
+                if prev == 0xFFFFFFFF or prev <= 0:
+                    break          # 失败, 或原本就没被挂起
+                if prev == 1:
+                    count += 1     # 从挂起态回到运行态
+                    break
+                # prev > 1: 还挂着多层, 继续释放
+        except Exception:
+            pass
+        finally:
+            CloseHandle(handle)
+    logging.info(f"▶️ 已恢复 {count} 个目标线程")
+    return count
+
+
+# ==========================================
 # 网络防火墙 (netsh)
 # ==========================================
 def _netsh(cmd, quiet=True):
+    """执行 netsh 命令。
+
+    只看有没有抛异常, **不检查返回码**: netsh 失败 (例如非管理员、防火墙
+    服务被禁用) 时这里依然返回 True。因此调用方拿到的计数是「命令已下发
+    的条数」, 不等于「规则真的生效的条数」。
+
+    cmd.exe 用 clean_child_env() 起: 不把打包器的内部变量 (_PYI_* 等)
+    带过去, 免得拉起的进程被误判成同一进程树。
+    """
     try:
         subprocess.run(cmd, shell=True, capture_output=True, text=True,
                        timeout=10, startupinfo=hidden_startupinfo(),
-                       creationflags=hidden_creationflags())
+                       creationflags=hidden_creationflags(),
+                       env=clean_child_env())
         return True
     except Exception as e:
         if not quiet:
@@ -304,7 +418,12 @@ def _netsh(cmd, quiet=True):
 
 
 def block_network():
-    """禁止所有目标进程出站网络, 返回成功数"""
+    """给所有目标进程加出站阻止防火墙规则, 返回已下发命令的条数。
+
+    规则名为 SeewoGuard_Block_<文件名>, 卸载/恢复时按同名删除
+    (见 allow_network)。规则会持久保存在系统中, 程序异常退出也不会自动
+    清除, 需要恢复网络时点「允许网络」。
+    """
     logging.info("🚫 禁止网络...")
     success = 0
     for p in TARGET_EXES:
@@ -319,7 +438,7 @@ def block_network():
 
 
 def allow_network():
-    """删除阻止规则恢复网络, 返回成功数"""
+    """删除 block_network 添加的出站阻止规则, 返回已下发命令的条数"""
     logging.info("🌐 恢复网络...")
     removed = 0
     for p in TARGET_EXES:

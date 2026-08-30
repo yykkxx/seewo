@@ -407,3 +407,53 @@ PostQuitMessage.restype = None
 GetModuleHandleW = kernel32.GetModuleHandleW
 GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 GetModuleHandleW.restype = wintypes.HMODULE
+
+# ==========================================
+# 线程枚举 / 挂起 / 恢复 (冻结目标进程用)
+#
+# 与 TerminateProcess 的区别: 挂起不结束进程, 进程仍留在列表里但所有
+# 线程停止执行。对方的看护通常按"进程是否还在"判断存活, 因此挂起不会
+# 触发重启, 而杀进程会。
+# ==========================================
+TH32CS_SNAPTHREAD = 0x00000004   # CreateToolhelp32Snapshot: 枚举线程
+THREAD_SUSPEND_RESUME = 0x0002   # OpenThread 访问权限: 挂起 / 恢复
+INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+
+
+class THREADENTRY32(ctypes.Structure):
+    """tagTHREADENTRY32: 线程快照条目"""
+
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ThreadID", wintypes.DWORD),
+        ("th32OwnerProcessID", wintypes.DWORD),
+        ("tpBasePri", ctypes.c_long),
+        ("tpDeltaPri", ctypes.c_long),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+CreateToolhelp32Snapshot = kernel32.CreateToolhelp32Snapshot
+CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+
+Thread32First = kernel32.Thread32First
+Thread32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(THREADENTRY32)]
+Thread32First.restype = wintypes.BOOL
+
+Thread32Next = kernel32.Thread32Next
+Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(THREADENTRY32)]
+Thread32Next.restype = wintypes.BOOL
+
+OpenThread = kernel32.OpenThread
+OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+OpenThread.restype = wintypes.HANDLE
+
+SuspendThread = kernel32.SuspendThread
+SuspendThread.argtypes = [wintypes.HANDLE]
+SuspendThread.restype = wintypes.DWORD
+
+ResumeThread = kernel32.ResumeThread
+ResumeThread.argtypes = [wintypes.HANDLE]
+ResumeThread.restype = wintypes.DWORD
